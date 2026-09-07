@@ -1,0 +1,30 @@
+# ---- Python ----
+__pycache__/
+*.py[cod]
+*.pyo
+*.pyd
+*.egg-info/
+build/
+dist/
+.venv/
+venv/
+env/
+
+# ---- Node ----
+node_modules/
+
+# ---- IDE / 编辑器 ----
+.vscode/
+.idea/
+*.swp
+*.swo
+
+# ---- 系统 / 临时 ----
+.DS_Store
+Thumbs.db
+*.log
+*.tmp
+
+# ---- 密钥（勿提交） ----
+.env
+.env.*

@@ -1,0 +1,241 @@
+/**
+ * @fileoverview Lightweight study count tool — no data fetched, just the total.
+ * @module mcp-server/tools/definitions/get-study-count.tool
+ */
+
+import { tool, z } from '@cyanheads/mcp-ts-core';
+import { JsonRpcErrorCode } from '@cyanheads/mcp-ts-core/errors';
+import { getClinicalTrialsService } from '@/services/clinical-trials/clinical-trials-service.js';
+import {
+  blankValueMessage,
+  buildAdvancedFilter,
+  firstBlankListParam,
+  firstBlankParam,
+  toArray,
+} from '../utils/query-helpers.js';
+import { RECOVERY_HINTS } from '../utils/recovery-hints.js';
+
+export const getStudyCount = tool('clinicaltrials_get_study_count', {
+  description: `Get total clinical trial study count from ClinicalTrials.gov matching a query, without fetching study data. Fast and lightweight. Use for quick statistics or to build breakdowns by calling multiple times with different filters (e.g., count by phase, count by status, count recruiting vs completed for a condition).`,
+  annotations: {
+    readOnlyHint: true,
+    idempotentHint: true,
+    openWorldHint: true,
+  },
+
+  errors: [
+    {
+      reason: 'blank_value',
+      code: JsonRpcErrorCode.ValidationError,
+      when: 'A parameter was supplied with a blank, whitespace-only, or empty-list value.',
+      recovery: RECOVERY_HINTS.blank_value,
+    },
+    {
+      reason: 'field_invalid',
+      code: JsonRpcErrorCode.ValidationError,
+      when: 'A field name in the advanced filter or AREA[] expression is invalid (often a module name instead of a piece name).',
+      recovery: RECOVERY_HINTS.field_invalid,
+    },
+    {
+      reason: 'enum_invalid',
+      code: JsonRpcErrorCode.ValidationError,
+      when: 'statusFilter or phaseFilter contains a value ClinicalTrials.gov does not accept.',
+      recovery: RECOVERY_HINTS.enum_invalid,
+    },
+    {
+      reason: 'query_parse_error',
+      code: JsonRpcErrorCode.ValidationError,
+      when: 'A free-text query or advancedFilter expression uses syntax the upstream Essie parser rejects — typically a `[` or `]` outside an AREA[…] / RANGE[…] expression, an unmatched `(` / `)`, or an unterminated quote in a query/conditionQuery/etc. value.',
+      recovery: RECOVERY_HINTS.query_parse_error,
+    },
+    {
+      reason: 'rate_limited',
+      code: JsonRpcErrorCode.RateLimited,
+      when: 'ClinicalTrials.gov returned 429 after retry budget exhausted.',
+      recovery: RECOVERY_HINTS.rate_limited,
+      retryable: true,
+    },
+  ],
+
+  input: z.object({
+    query: z
+      .string()
+      .optional()
+      .describe(
+        'General free-text search across all fields. Runs the 57-field relevance search ClinicalTrials.gov publishes for this parameter — NCTId, NCTIdAlias, OrgStudyId, SecondaryId, Acronym, BriefTitle, OfficialTitle, Condition, InterventionName, InterventionOtherName, Phase, StdAge, StudyType, BriefSummary, outcome measures and their descriptions, LeadSponsorName, CollaboratorName, the Location* fields, the Design* fields, and the ConditionAncestorTerm/InterventionAncestorTerm MeSH umbrellas — so a hit need not carry your term in the field you had in mind. Plain words plus AND, OR, NOT. `[ ]` are valid only inside an AREA[FieldName]value or RANGE[min, max] expression — those work here as well as in advancedFilter, so AREA[Phase]PHASE2 is accepted in this parameter; a stray bracket fails. `( )` group sub-expressions and work when matched; `,` acts as AND. The dedicated *Query parameters (conditionQuery, interventionQuery, etc.) scope a search to one field.',
+      ),
+    conditionQuery: z
+      .string()
+      .optional()
+      .describe(
+        'Condition/disease-specific search. E.g., "Type 2 Diabetes", "non-small cell lung cancer". Matches Condition, BriefTitle, OfficialTitle, ConditionMeshTerm, ConditionAncestorTerm, Keyword, and NCTId. ConditionAncestorTerm is the MeSH umbrella above the conditions a study itself lists, so results run broader than those lists — a study can match a parent term it never names. Plain words plus AND/OR/NOT. `[ ]` are valid only inside an AREA[FieldName]value or RANGE[min, max] expression, which this parameter accepts; a stray bracket fails. `( )` group sub-expressions when matched; `,` acts as AND.',
+      ),
+    interventionQuery: z
+      .string()
+      .optional()
+      .describe(
+        'Intervention/treatment search. E.g., "pembrolizumab", "cognitive behavioral therapy". Matches InterventionName, InterventionType, ArmGroupType, InterventionOtherName, BriefTitle, OfficialTitle, ArmGroupLabel, InterventionMeshTerm, Keyword, InterventionAncestorTerm, InterventionDescription, and ArmGroupDescription. InterventionAncestorTerm is the MeSH umbrella above the interventions a study itself lists, so results run broader than those lists. Plain words plus AND/OR/NOT. `[ ]` are valid only inside an AREA[FieldName]value or RANGE[min, max] expression, which this parameter accepts; a stray bracket fails. `( )` group sub-expressions when matched; `,` acts as AND.',
+      ),
+    locationQuery: z
+      .string()
+      .optional()
+      .describe(
+        'Location search — city, state, country, or facility name. Matches LocationCity, LocationState, LocationCountry, LocationFacility, and LocationZip; a study matches when any of its sites does. Plain words plus AND/OR/NOT. `[ ]` are valid only inside an AREA[FieldName]value or RANGE[min, max] expression, which this parameter accepts; a stray bracket fails. `( )` group sub-expressions when matched; `,` acts as AND.',
+      ),
+    sponsorQuery: z
+      .string()
+      .optional()
+      .describe(
+        'Sponsor/collaborator name search. Matches LeadSponsorName, CollaboratorName, and OrgFullName. Plain words plus AND/OR/NOT. `[ ]` are valid only inside an AREA[FieldName]value or RANGE[min, max] expression, which this parameter accepts; a stray bracket fails. `( )` group sub-expressions when matched; `,` acts as AND.',
+      ),
+    titleQuery: z
+      .string()
+      .optional()
+      .describe(
+        'Search within study titles and acronyms only. Matches Acronym, BriefTitle, and OfficialTitle. Plain words plus AND/OR/NOT. `[ ]` are valid only inside an AREA[FieldName]value or RANGE[min, max] expression, which this parameter accepts; a stray bracket fails. `( )` group sub-expressions when matched; `,` acts as AND.',
+      ),
+    outcomeQuery: z
+      .string()
+      .optional()
+      .describe(
+        'Search within outcome measure fields. Matches PrimaryOutcomeMeasure, SecondaryOutcomeMeasure, OtherOutcomeMeasure, and OutcomeMeasureTitle, plus their description counterparts PrimaryOutcomeDescription, SecondaryOutcomeDescription, OtherOutcomeDescription, OutcomeMeasureDescription, and OutcomeMeasurePopulationDescription — so a term appearing only in outcome prose still matches. Plain words plus AND/OR/NOT. `[ ]` are valid only inside an AREA[FieldName]value or RANGE[min, max] expression, which this parameter accepts; a stray bracket fails. `( )` group sub-expressions when matched; `,` acts as AND.',
+      ),
+    statusFilter: z
+      .union([
+        z.string().describe('A single status value.'),
+        z.array(z.string()).describe('Multiple status values (OR).'),
+      ])
+      .optional()
+      .describe(
+        `Filter by study status. Omit to count all statuses — an empty list is rejected, not treated as "no filter". Values: RECRUITING, COMPLETED, ACTIVE_NOT_RECRUITING, NOT_YET_RECRUITING, ENROLLING_BY_INVITATION, SUSPENDED, TERMINATED, WITHDRAWN, UNKNOWN, WITHHELD, NO_LONGER_AVAILABLE, AVAILABLE, APPROVED_FOR_MARKETING, TEMPORARILY_NOT_AVAILABLE.`,
+      ),
+    phaseFilter: z
+      .union([
+        z.string().describe('A single phase value.'),
+        z.array(z.string()).describe('Multiple phase values (OR).'),
+      ])
+      .optional()
+      .describe(
+        'Filter by trial phase. Omit to count all phases — an empty list is rejected, not treated as "no filter". Values: EARLY_PHASE1, PHASE1, PHASE2, PHASE3, PHASE4, NA.',
+      ),
+    advancedFilter: z
+      .string()
+      .optional()
+      .describe(
+        'Advanced filter using AREA[FieldName]value syntax. Examples: "AREA[StudyType]INTERVENTIONAL", "AREA[EnrollmentCount]RANGE[100, 1000]", "AREA[Phase]PHASE2 AND AREA[StudyType]INTERVENTIONAL", "(AREA[Phase]PHASE3 OR AREA[Phase]PHASE4) AND AREA[StudyType]INTERVENTIONAL". AND/OR/NOT join complete AREA[FieldName]value expressions; parentheses group them. Call clinicaltrials_get_field_definitions to find AREA[]-compatible field names.',
+      ),
+    includeUnknownEnrollment: z
+      .boolean()
+      .default(false)
+      .describe(
+        'Include studies whose EnrollmentCount is the upstream "unknown" sentinel (99999999). Excluded by default — the sentinel pollutes RANGE[N, MAX] queries. Set true for data-quality audits.',
+      ),
+  }),
+
+  output: z.object({
+    totalCount: z.number().describe('Total studies matching the query/filters.'),
+  }),
+
+  // Agent-facing context — query echo and empty-result guidance, disjoint from output.
+  enrichment: {
+    searchCriteria: z
+      .record(z.string(), z.unknown())
+      .optional()
+      .describe(
+        'Echo of active query/filter criteria applied to this count, including sentinelFilterActive when the default unknown-enrollment exclusion is in effect.',
+      ),
+    notice: z
+      .string()
+      .optional()
+      .describe(
+        'Recovery guidance when totalCount is 0 — suggests how to broaden the query or filters.',
+      ),
+  },
+
+  enrichmentTrailer: {
+    searchCriteria: {
+      render: (criteria) => {
+        if (!criteria || Object.keys(criteria).length === 0) return '';
+        const parts = Object.entries(criteria).map(([k, v]) =>
+          Array.isArray(v) ? `- **${k}:** [${(v as unknown[]).join(', ')}]` : `- **${k}:** ${v}`,
+        );
+        return `**Search Criteria:**\n${parts.join('\n')}`;
+      },
+    },
+  },
+
+  async handler(input, ctx) {
+    // A supplied-but-blank value is not an omitted one: buildSearchQuery drops
+    // falsy values, so a blank query would return the size of the whole
+    // registry as if it were the answer to the caller's question. advancedFilter
+    // fails both ways — '' is falsy and dropped, while ' ' is truthy and splices
+    // a blank term into a joined boolean expression. Reject in the handler — a
+    // schema-only rejection surfaces as a bare -32602 with no reason and no
+    // recovery hint.
+    const statusFilter = toArray(input.statusFilter);
+    const phaseFilter = toArray(input.phaseFilter);
+    const blankParam =
+      firstBlankParam({
+        query: input.query,
+        conditionQuery: input.conditionQuery,
+        interventionQuery: input.interventionQuery,
+        locationQuery: input.locationQuery,
+        sponsorQuery: input.sponsorQuery,
+        titleQuery: input.titleQuery,
+        outcomeQuery: input.outcomeQuery,
+        advancedFilter: input.advancedFilter,
+      }) ?? firstBlankListParam({ statusFilter, phaseFilter });
+    if (blankParam) {
+      throw ctx.fail('blank_value', blankValueMessage(blankParam), {
+        param: blankParam,
+        ...ctx.recoveryFor('blank_value'),
+      });
+    }
+
+    const service = getClinicalTrialsService();
+    const result = await service.searchStudies(
+      {
+        queryTerm: input.query,
+        queryCond: input.conditionQuery,
+        queryIntr: input.interventionQuery,
+        queryLocn: input.locationQuery,
+        querySpons: input.sponsorQuery,
+        queryTitles: input.titleQuery,
+        queryOutc: input.outcomeQuery,
+        filterOverallStatus: statusFilter,
+        filterAdvanced: buildAdvancedFilter(phaseFilter, input.advancedFilter),
+        countTotal: true,
+        pageSize: 0,
+        includeUnknownEnrollment: input.includeUnknownEnrollment,
+      },
+      ctx,
+    );
+    const totalCount = result.totalCount ?? 0;
+    ctx.log.info('Count completed', { totalCount });
+
+    const criteria: Record<string, unknown> = {};
+    if (input.query) criteria.query = input.query;
+    if (input.conditionQuery) criteria.conditionQuery = input.conditionQuery;
+    if (input.interventionQuery) criteria.interventionQuery = input.interventionQuery;
+    if (input.locationQuery) criteria.locationQuery = input.locationQuery;
+    if (input.sponsorQuery) criteria.sponsorQuery = input.sponsorQuery;
+    if (input.titleQuery) criteria.titleQuery = input.titleQuery;
+    if (input.outcomeQuery) criteria.outcomeQuery = input.outcomeQuery;
+    if (input.statusFilter) criteria.statusFilter = input.statusFilter;
+    if (input.phaseFilter) criteria.phaseFilter = input.phaseFilter;
+    if (input.advancedFilter) criteria.advancedFilter = input.advancedFilter;
+    // Flag the default unknown-enrollment exclusion (EnrollmentCount=99999999),
+    // mirroring search_studies — otherwise a count silently differs from an
+    // unfiltered /stats total with no signal that a filter was applied.
+    if (!input.includeUnknownEnrollment) criteria.sentinelFilterActive = true;
+
+    if (Object.keys(criteria).length > 0) ctx.enrich({ searchCriteria: criteria });
+    if (totalCount === 0) ctx.enrich.notice('Try broader search terms or fewer filters.');
+
+    return { totalCount };
+  },
+
+  format: (result) => [
+    { type: 'text', text: `${result.totalCount} studies match the specified criteria.` },
+  ],
+});

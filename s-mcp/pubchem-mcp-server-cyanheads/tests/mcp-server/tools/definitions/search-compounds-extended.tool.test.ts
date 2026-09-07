@@ -1,0 +1,721 @@
+/**
+ * @fileoverview Extended tests for search-compounds tool — edge cases, validation, and security.
+ * @module mcp-server/tools/definitions/search-compounds-extended.test
+ */
+
+import { JsonRpcErrorCode } from '@cyanheads/mcp-ts-core/errors';
+import { createMockContext, getEnrichment } from '@cyanheads/mcp-ts-core/testing';
+import { beforeEach, describe, expect, it, vi } from 'vitest';
+import { searchCompounds } from '@/mcp-server/tools/definitions/search-compounds.tool.js';
+
+const mockClient = {
+  searchByName: vi.fn(),
+  searchBySmiles: vi.fn(),
+  searchByInchiKey: vi.fn(),
+  searchByFormula: vi.fn(),
+  searchByStructure: vi.fn(),
+  getProperties: vi.fn(),
+};
+
+vi.mock('@/services/pubchem/pubchem-client.js', () => ({
+  getPubChemClient: () => mockClient,
+}));
+
+beforeEach(() => {
+  vi.resetAllMocks();
+});
+
+describe('searchCompounds handler — superstructure search', () => {
+  it('searches by superstructure', async () => {
+    mockClient.searchByStructure.mockResolvedValueOnce([500, 600]);
+    const ctx = createMockContext({ errors: searchCompounds.errors });
+    const input = searchCompounds.input.parse({
+      searchType: 'superstructure',
+      query: 'c1ccccc1',
+      queryType: 'smiles',
+    });
+    const result = await searchCompounds.handler(input, ctx);
+    const enrichment = getEnrichment(ctx);
+
+    expect(mockClient.searchByStructure).toHaveBeenCalledWith(
+      'superstructure',
+      'c1ccccc1',
+      'smiles',
+      90,
+      21,
+    );
+    expect(enrichment.totalFound).toBe(2);
+    expect(result.results).toHaveLength(2);
+  });
+
+  it('searches by superstructure with cid queryType', async () => {
+    mockClient.searchByStructure.mockResolvedValueOnce([1, 2, 3]);
+    const ctx = createMockContext({ errors: searchCompounds.errors });
+    const input = searchCompounds.input.parse({
+      searchType: 'superstructure',
+      query: '2244',
+      queryType: 'cid',
+    });
+    const result = await searchCompounds.handler(input, ctx);
+
+    expect(mockClient.searchByStructure).toHaveBeenCalledWith(
+      'superstructure',
+      '2244',
+      'cid',
+      90,
+      21,
+    );
+    expect(result.results).toHaveLength(3);
+  });
+});
+
+describe('searchCompounds handler — identifier batch edge cases', () => {
+  it('handles identifier that resolves to no CIDs', async () => {
+    mockClient.searchByName.mockResolvedValueOnce([]);
+    const ctx = createMockContext({ errors: searchCompounds.errors });
+    const input = searchCompounds.input.parse({
+      searchType: 'identifier',
+      identifierType: 'name',
+      identifiers: ['nonexistentcompound12345'],
+    });
+    const result = await searchCompounds.handler(input, ctx);
+    const enrichment = getEnrichment(ctx);
+
+    expect(result.results).toHaveLength(0);
+    expect(enrichment.totalFound).toBe(0);
+    expect(enrichment.notice).toBeDefined();
+  });
+
+  it('deduplicates across multiple identifiers resolving to overlapping CIDs', async () => {
+    mockClient.searchByName.mockResolvedValueOnce([2244, 3672]).mockResolvedValueOnce([3672, 4999]);
+    const ctx = createMockContext({ errors: searchCompounds.errors });
+    const input = searchCompounds.input.parse({
+      searchType: 'identifier',
+      identifierType: 'name',
+      identifiers: ['aspirin', 'ibuprofen'],
+    });
+    const result = await searchCompounds.handler(input, ctx);
+
+    // 2244 + 3672 + 4999 after dedup = 3
+    expect(result.results).toHaveLength(3);
+  });
+
+  it('surfaces unresolvedIdentifiers and a partial-miss notice (#29)', async () => {
+    // water → 962, notreal1zzz → [], caffeine → 2519, notreal2zzz → []
+    mockClient.searchByName
+      .mockResolvedValueOnce([962])
+      .mockResolvedValueOnce([])
+      .mockResolvedValueOnce([2519])
+      .mockResolvedValueOnce([]);
+    const ctx = createMockContext({ errors: searchCompounds.errors });
+    const input = searchCompounds.input.parse({
+      searchType: 'identifier',
+      identifierType: 'name',
+      identifiers: ['water', 'notreal1zzz', 'caffeine', 'notreal2zzz'],
+    });
+    const result = await searchCompounds.handler(input, ctx);
+    const enrichment = getEnrichment(ctx);
+
+    expect(result.results).toHaveLength(2);
+    expect(result.unresolvedIdentifiers).toEqual(['notreal1zzz', 'notreal2zzz']);
+    expect(enrichment.notice).toBeDefined();
+    expect(enrichment.notice).toContain('2 of 4');
+    expect(enrichment.notice).toContain('notreal1zzz');
+    expect(enrichment.notice).toContain('notreal2zzz');
+  });
+
+  it('omits unresolvedIdentifiers when every identifier resolves (#29)', async () => {
+    mockClient.searchByName.mockResolvedValueOnce([962]).mockResolvedValueOnce([2519]);
+    const ctx = createMockContext({ errors: searchCompounds.errors });
+    const input = searchCompounds.input.parse({
+      searchType: 'identifier',
+      identifierType: 'name',
+      identifiers: ['water', 'caffeine'],
+    });
+    const result = await searchCompounds.handler(input, ctx);
+    const enrichment = getEnrichment(ctx);
+
+    expect(result.unresolvedIdentifiers).toBeUndefined();
+    expect(enrichment.notice).toBeUndefined();
+  });
+
+  it('signals a CID collision when two distinct identifiers resolve to the same CID (#29)', async () => {
+    // Both names resolve to CID 2244 — the result row can echo only one.
+    mockClient.searchByName.mockResolvedValueOnce([2244]).mockResolvedValueOnce([2244]);
+    const ctx = createMockContext({ errors: searchCompounds.errors });
+    const input = searchCompounds.input.parse({
+      searchType: 'identifier',
+      identifierType: 'name',
+      identifiers: ['aspirin', 'acetylsalicylic acid'],
+    });
+    const result = await searchCompounds.handler(input, ctx);
+    const enrichment = getEnrichment(ctx);
+
+    expect(result.results).toHaveLength(1);
+    // First requester in input order deterministically wins the echo.
+    expect(result.results[0]!.identifier).toBe('aspirin');
+    expect(enrichment.notice).toBeDefined();
+    expect(enrichment.notice).toContain('CID 2244');
+    expect(enrichment.notice).toContain('aspirin');
+    expect(enrichment.notice).toContain('acetylsalicylic acid');
+  });
+
+  it('accepts maximum 25 identifiers', () => {
+    const ids = Array.from({ length: 25 }, (_, i) => `compound${i}`);
+    expect(() =>
+      searchCompounds.input.parse({
+        searchType: 'identifier',
+        identifierType: 'name',
+        identifiers: ids,
+      }),
+    ).not.toThrow();
+  });
+
+  it('rejects more than 25 identifiers', () => {
+    const ids = Array.from({ length: 26 }, (_, i) => `compound${i}`);
+    expect(() =>
+      searchCompounds.input.parse({
+        searchType: 'identifier',
+        identifierType: 'name',
+        identifiers: ids,
+      }),
+    ).toThrow();
+  });
+});
+
+describe('searchCompounds handler — boundary values', () => {
+  /* A fractional cap reaches PubChem verbatim on the bounded searches — the handler derives
+   * the upstream record window from it — so an unconstrained maxResults fails at the upstream
+   * with an HTTP 400 rather than being floored locally. */
+  it('rejects a fractional maxResults', () => {
+    expect(() =>
+      searchCompounds.input.parse({
+        searchType: 'formula',
+        formula: 'C21H30O2',
+        maxResults: 7.5,
+      }),
+    ).toThrow();
+  });
+
+  it('accepts minimum maxResults of 1', async () => {
+    mockClient.searchByFormula.mockResolvedValueOnce([1, 2, 3]);
+    const ctx = createMockContext({ errors: searchCompounds.errors });
+    const input = searchCompounds.input.parse({
+      searchType: 'formula',
+      formula: 'C6H12O6',
+      maxResults: 1,
+    });
+    const result = await searchCompounds.handler(input, ctx);
+
+    expect(result.results).toHaveLength(1);
+  });
+
+  it('accepts maximum maxResults of 200', async () => {
+    const manyIds = Array.from({ length: 200 }, (_, i) => i + 1);
+    mockClient.searchByFormula.mockResolvedValueOnce(manyIds);
+    const ctx = createMockContext({ errors: searchCompounds.errors });
+    const input = searchCompounds.input.parse({
+      searchType: 'formula',
+      formula: 'C6H12O6',
+      maxResults: 200,
+    });
+    const result = await searchCompounds.handler(input, ctx);
+
+    expect(result.results).toHaveLength(200);
+  });
+
+  it('rejects maxResults below 1', () => {
+    expect(() =>
+      searchCompounds.input.parse({
+        searchType: 'formula',
+        formula: 'C6H12O6',
+        maxResults: 0,
+      }),
+    ).toThrow();
+  });
+
+  it('similarity threshold minimum of 70 accepted', () => {
+    expect(() =>
+      searchCompounds.input.parse({
+        searchType: 'similarity',
+        query: '2244',
+        queryType: 'cid',
+        threshold: 70,
+      }),
+    ).not.toThrow();
+  });
+
+  it('similarity threshold below 70 rejected', () => {
+    expect(() =>
+      searchCompounds.input.parse({
+        searchType: 'similarity',
+        query: '2244',
+        queryType: 'cid',
+        threshold: 69,
+      }),
+    ).toThrow();
+  });
+});
+
+describe('searchCompounds handler — cid-query validation (#26)', () => {
+  it('throws invalid_cid_query when queryType "cid" query is not a CID', async () => {
+    const ctx = createMockContext({ errors: searchCompounds.errors });
+    const input = searchCompounds.input.parse({
+      searchType: 'similarity',
+      query: 'not-a-cid',
+      queryType: 'cid',
+      maxResults: 3,
+    });
+    await expect(searchCompounds.handler(input, ctx)).rejects.toMatchObject({
+      code: JsonRpcErrorCode.ValidationError,
+      data: { reason: 'invalid_cid_query' },
+    });
+    // Rejected before the upstream call — no raw PubChem 400.
+    expect(mockClient.searchByStructure).not.toHaveBeenCalled();
+  });
+
+  it('throws invalid_cid_query when queryType "cid" query is "0"', async () => {
+    const ctx = createMockContext({ errors: searchCompounds.errors });
+    const input = searchCompounds.input.parse({
+      searchType: 'substructure',
+      query: '0',
+      queryType: 'cid',
+    });
+    await expect(searchCompounds.handler(input, ctx)).rejects.toMatchObject({
+      data: { reason: 'invalid_cid_query' },
+    });
+    expect(mockClient.searchByStructure).not.toHaveBeenCalled();
+  });
+
+  it('accepts a positive-integer CID query with queryType "cid"', async () => {
+    mockClient.searchByStructure.mockResolvedValueOnce([1, 2]);
+    const ctx = createMockContext({ errors: searchCompounds.errors });
+    const input = searchCompounds.input.parse({
+      searchType: 'similarity',
+      query: '2244',
+      queryType: 'cid',
+    });
+    const result = await searchCompounds.handler(input, ctx);
+
+    expect(result.results).toHaveLength(2);
+    expect(mockClient.searchByStructure).toHaveBeenCalledWith('similarity', '2244', 'cid', 90, 21);
+  });
+
+  it('does not apply the CID shape check to smiles queries', async () => {
+    mockClient.searchByStructure.mockResolvedValueOnce([100]);
+    const ctx = createMockContext({ errors: searchCompounds.errors });
+    const input = searchCompounds.input.parse({
+      searchType: 'substructure',
+      query: 'not-a-cid-but-a-smiles',
+      queryType: 'smiles',
+    });
+    const result = await searchCompounds.handler(input, ctx);
+
+    expect(result.results).toHaveLength(1);
+    expect(mockClient.searchByStructure).toHaveBeenCalledWith(
+      'substructure',
+      'not-a-cid-but-a-smiles',
+      'smiles',
+      90,
+      21,
+    );
+  });
+});
+
+describe('searchCompounds handler — security', () => {
+  it('passes injection strings as identifiers without interpreting them', async () => {
+    // SQL/script injection in identifier — must be passed through opaquely, not interpreted
+    mockClient.searchByName.mockResolvedValueOnce([]);
+    const ctx = createMockContext({ errors: searchCompounds.errors });
+    const injected = "'; DROP TABLE compounds; --";
+    const input = searchCompounds.input.parse({
+      searchType: 'identifier',
+      identifierType: 'name',
+      identifiers: [injected],
+    });
+    const result = await searchCompounds.handler(input, ctx);
+
+    // Handler must call the client with the raw identifier unchanged
+    expect(mockClient.searchByName).toHaveBeenCalledWith(injected);
+    // No results, but no crash
+    expect(result.results).toHaveLength(0);
+  });
+
+  it('passes path traversal strings in formula without crashing', async () => {
+    mockClient.searchByFormula.mockResolvedValueOnce([]);
+    const ctx = createMockContext({ errors: searchCompounds.errors });
+    const input = searchCompounds.input.parse({
+      searchType: 'formula',
+      formula: '../../etc/passwd',
+    });
+    const result = await searchCompounds.handler(input, ctx);
+
+    expect(result.results).toHaveLength(0);
+    expect(mockClient.searchByFormula).toHaveBeenCalledWith('../../etc/passwd', false, 21);
+  });
+
+  it('passes oversized formula string to client without crash', async () => {
+    // 10KB formula string — handler must not crash on oversized input
+    const bigFormula = 'C'.repeat(10000);
+    mockClient.searchByFormula.mockResolvedValueOnce([]);
+    const ctx = createMockContext({ errors: searchCompounds.errors });
+    const input = searchCompounds.input.parse({
+      searchType: 'formula',
+      formula: bigFormula,
+    });
+    const result = await searchCompounds.handler(input, ctx);
+
+    expect(result.results).toHaveLength(0);
+  });
+
+  it('handles unicode identifiers without crashing', async () => {
+    mockClient.searchByName.mockResolvedValueOnce([]);
+    const ctx = createMockContext({ errors: searchCompounds.errors });
+    const input = searchCompounds.input.parse({
+      searchType: 'identifier',
+      identifierType: 'name',
+      identifiers: ['阿司匹林'],
+    });
+    const result = await searchCompounds.handler(input, ctx);
+
+    expect(result.results).toHaveLength(0);
+    expect(mockClient.searchByName).toHaveBeenCalledWith('阿司匹林');
+  });
+
+  it('error message does not expose internal server paths', async () => {
+    const ctx = createMockContext({ errors: searchCompounds.errors });
+    const input = searchCompounds.input.parse({ searchType: 'formula' });
+    await expect(searchCompounds.handler(input, ctx)).rejects.toMatchObject({
+      code: JsonRpcErrorCode.ValidationError,
+      data: { reason: 'missing_formula' },
+    });
+  });
+});
+
+describe('searchCompounds handler — properties hydration edge cases', () => {
+  it('skips properties fetch when result set is empty', async () => {
+    mockClient.searchByFormula.mockResolvedValueOnce([]);
+    const ctx = createMockContext({ errors: searchCompounds.errors });
+    const input = searchCompounds.input.parse({
+      searchType: 'formula',
+      formula: 'XXXXXX',
+      properties: ['MolecularFormula'],
+    });
+    await searchCompounds.handler(input, ctx);
+
+    expect(mockClient.getProperties).not.toHaveBeenCalled();
+  });
+
+  it('hydrates when properties requested and results present', async () => {
+    mockClient.searchByName.mockResolvedValueOnce([2244]);
+    mockClient.getProperties.mockResolvedValueOnce([
+      { CID: 2244, MolecularFormula: 'C9H8O4', MolecularWeight: 180.16 },
+    ]);
+    const ctx = createMockContext({ errors: searchCompounds.errors });
+    const input = searchCompounds.input.parse({
+      searchType: 'identifier',
+      identifierType: 'name',
+      identifiers: ['aspirin'],
+      properties: ['MolecularFormula', 'MolecularWeight'],
+    });
+    const result = await searchCompounds.handler(input, ctx);
+
+    expect(mockClient.getProperties).toHaveBeenCalledWith(
+      [2244],
+      ['MolecularFormula', 'MolecularWeight'],
+    );
+    expect(result.results[0]!.properties).toEqual({
+      MolecularFormula: 'C9H8O4',
+      MolecularWeight: 180.16,
+    });
+    // CID must not appear in properties
+    expect(result.results[0]!.properties).not.toHaveProperty('CID');
+  });
+});
+
+describe('searchCompounds format — additional cases', () => {
+  it('renders unresolvedIdentifiers alongside results (#29)', () => {
+    const blocks = searchCompounds.format!({
+      results: [{ cid: 962, identifier: 'water' }],
+      unresolvedIdentifiers: ['notreal1zzz', 'notreal2zzz'],
+    });
+    const text = (blocks[0]! as { type: 'text'; text: string }).text;
+    expect(text).toContain('water');
+    expect(text).toContain('Unresolved identifiers');
+    expect(text).toContain('notreal1zzz');
+    expect(text).toContain('notreal2zzz');
+  });
+
+  it('renders unresolvedIdentifiers even when all identifiers missed (#29)', () => {
+    const blocks = searchCompounds.format!({
+      results: [],
+      unresolvedIdentifiers: ['notreal1zzz'],
+    });
+    const text = (blocks[0]! as { type: 'text'; text: string }).text;
+    expect(text).toContain('No results');
+    expect(text).toContain('notreal1zzz');
+  });
+
+  it('formats single CID without identifier', () => {
+    const blocks = searchCompounds.format!({
+      results: [{ cid: 5988 }],
+    });
+    const text = (blocks[0]! as { type: 'text'; text: string }).text;
+    expect(text).toContain('5988');
+    expect(text).not.toContain('undefined');
+  });
+
+  it('formats multiple properties per CID', () => {
+    const blocks = searchCompounds.format!({
+      results: [
+        {
+          cid: 2244,
+          identifier: 'aspirin',
+          properties: { MolecularFormula: 'C9H8O4', MolecularWeight: 180.16 },
+        },
+      ],
+    });
+    const text = (blocks[0]! as { type: 'text'; text: string }).text;
+    expect(text).toContain('MolecularFormula: C9H8O4');
+    expect(text).toContain('MolecularWeight: 180.16');
+    expect(text).toContain('CID 2244');
+    expect(text).toContain('aspirin');
+  });
+});
+
+describe('searchCompounds handler — offset paging (#38)', () => {
+  it('grows the bounded upstream request to cover the offset', async () => {
+    mockClient.searchByStructure.mockResolvedValueOnce(Array.from({ length: 26 }, (_, i) => i + 1));
+    const ctx = createMockContext({ errors: searchCompounds.errors });
+    const input = searchCompounds.input.parse({
+      searchType: 'substructure',
+      query: 'c1ccccc1',
+      queryType: 'smiles',
+      offset: 20,
+      maxResults: 5,
+    });
+    const result = await searchCompounds.handler(input, ctx);
+
+    // offset + maxResults + 1 — the endpoint takes a record count, not a start position.
+    expect(mockClient.searchByStructure).toHaveBeenCalledWith(
+      'substructure',
+      'c1ccccc1',
+      'smiles',
+      90,
+      26,
+    );
+    expect(result.results.map((r) => r.cid)).toEqual([21, 22, 23, 24, 25]);
+  });
+
+  it('reports more matches beyond a saturated bounded page even without an exact total', async () => {
+    // 26 records for a cap of 26 — saturated, so a further match exists past the window.
+    mockClient.searchByFormula.mockResolvedValueOnce(Array.from({ length: 26 }, (_, i) => i + 1));
+    const ctx = createMockContext({ errors: searchCompounds.errors });
+    const input = searchCompounds.input.parse({
+      searchType: 'formula',
+      formula: 'C6H12O6',
+      offset: 20,
+      maxResults: 5,
+    });
+    await searchCompounds.handler(input, ctx);
+    const enrichment = getEnrichment(ctx);
+
+    expect(enrichment.totalFound).toBeUndefined();
+    expect(enrichment.totalFoundAtLeast).toBe(26);
+    expect(enrichment.offset).toBe(20);
+    expect(enrichment.nextOffset).toBe(25);
+    expect(enrichment.notice).toContain('Showing matches 21-25');
+  });
+
+  it('pages identifier lookups over the already-resolved set without a second request', async () => {
+    mockClient.searchByName.mockResolvedValueOnce([10, 20, 30, 40, 50]);
+    const ctx = createMockContext({ errors: searchCompounds.errors });
+    const input = searchCompounds.input.parse({
+      searchType: 'identifier',
+      identifierType: 'name',
+      identifiers: ['aspirin'],
+      offset: 2,
+      maxResults: 2,
+    });
+    const result = await searchCompounds.handler(input, ctx);
+    const enrichment = getEnrichment(ctx);
+
+    expect(mockClient.searchByName).toHaveBeenCalledTimes(1);
+    expect(mockClient.searchByName).toHaveBeenCalledWith('aspirin');
+    expect(result.results.map((r) => r.cid)).toEqual([30, 40]);
+    expect(enrichment.totalFound).toBe(5);
+    expect(enrichment.nextOffset).toBe(4);
+  });
+
+  it('omits nextOffset and truncated on the terminal page', async () => {
+    mockClient.searchByName.mockResolvedValueOnce([10, 20, 30]);
+    const ctx = createMockContext({ errors: searchCompounds.errors });
+    const input = searchCompounds.input.parse({
+      searchType: 'identifier',
+      identifierType: 'name',
+      identifiers: ['aspirin'],
+      offset: 2,
+      maxResults: 2,
+    });
+    const result = await searchCompounds.handler(input, ctx);
+    const enrichment = getEnrichment(ctx);
+
+    expect(result.results.map((r) => r.cid)).toEqual([30]);
+    expect(enrichment.nextOffset).toBeUndefined();
+    expect(enrichment.truncated).toBeUndefined();
+    expect(enrichment.notice).toBeUndefined();
+  });
+
+  it('names the valid bound when the offset runs past the matches found', async () => {
+    mockClient.searchByFormula.mockResolvedValueOnce([1, 2, 3]);
+    const ctx = createMockContext({ errors: searchCompounds.errors });
+    const input = searchCompounds.input.parse({
+      searchType: 'formula',
+      formula: 'C6H12O6',
+      offset: 50,
+      maxResults: 10,
+    });
+    const result = await searchCompounds.handler(input, ctx);
+    const enrichment = getEnrichment(ctx);
+
+    expect(result.results).toEqual([]);
+    expect(enrichment.totalFound).toBe(3);
+    expect(enrichment.notice).toBe(
+      'offset 50 is past the 3 match(es) found. Pass an offset below 3.',
+    );
+  });
+
+  it('keeps a saturated bounded page non-empty, so the empty-page bound is always exact', async () => {
+    // Cap is 100 + 10 + 1 = 111; a full 111 back is saturated, and the page still fills.
+    mockClient.searchByStructure.mockResolvedValueOnce(
+      Array.from({ length: 111 }, (_, i) => i + 1),
+    );
+    const ctx = createMockContext({ errors: searchCompounds.errors });
+    const input = searchCompounds.input.parse({
+      searchType: 'similarity',
+      query: '2244',
+      queryType: 'cid',
+      offset: 100,
+      maxResults: 10,
+    });
+    const result = await searchCompounds.handler(input, ctx);
+    const enrichment = getEnrichment(ctx);
+
+    expect(result.results).toHaveLength(10);
+    expect(enrichment.totalFoundAtLeast).toBe(111);
+    expect(enrichment.nextOffset).toBe(110);
+  });
+
+  it('keeps continuing when duplicates shrink a saturated page below its cap', async () => {
+    // Cap is 4; PubChem returns 4 records but one is a repeat, so the deduped set is exactly the
+    // page. The saturation is what proves a further match exists — the deduped count cannot.
+    mockClient.searchByFormula.mockResolvedValueOnce([1, 2, 3, 1]);
+    const ctx = createMockContext({ errors: searchCompounds.errors });
+    const input = searchCompounds.input.parse({
+      searchType: 'formula',
+      formula: 'C6H12O6',
+      maxResults: 3,
+    });
+    const result = await searchCompounds.handler(input, ctx);
+    const enrichment = getEnrichment(ctx);
+
+    expect(result.results.map((r) => r.cid)).toEqual([1, 2, 3]);
+    expect(enrichment.truncated).toBe(true);
+    expect(enrichment.nextOffset).toBe(3);
+  });
+
+  it('still reports unresolved identifiers on a page past the first (#29)', async () => {
+    mockClient.searchByName.mockResolvedValueOnce([10, 20, 30]).mockResolvedValueOnce([]);
+    const ctx = createMockContext({ errors: searchCompounds.errors });
+    const input = searchCompounds.input.parse({
+      searchType: 'identifier',
+      identifierType: 'name',
+      identifiers: ['aspirin', 'notreal1zzz'],
+      offset: 2,
+      maxResults: 2,
+    });
+    const result = await searchCompounds.handler(input, ctx);
+
+    expect(result.unresolvedIdentifiers).toEqual(['notreal1zzz']);
+    expect(getEnrichment(ctx).notice).toContain('notreal1zzz');
+  });
+
+  it('hydrates properties for the page returned, not the first page', async () => {
+    mockClient.searchByName.mockResolvedValueOnce([10, 20, 30, 40]);
+    mockClient.getProperties.mockResolvedValueOnce([{ CID: 30, MolecularFormula: 'H2O' }]);
+    const ctx = createMockContext({ errors: searchCompounds.errors });
+    const input = searchCompounds.input.parse({
+      searchType: 'identifier',
+      identifierType: 'name',
+      identifiers: ['aspirin'],
+      offset: 2,
+      maxResults: 1,
+      properties: ['MolecularFormula'],
+    });
+    await searchCompounds.handler(input, ctx);
+
+    expect(mockClient.getProperties).toHaveBeenCalledWith([30], ['MolecularFormula']);
+  });
+
+  it('walks every page without repeating or skipping a CID', async () => {
+    const all = [10, 20, 30, 40, 50];
+    const collected: number[] = [];
+    let offset: number | undefined = 0;
+
+    for (let page = 0; page < 5 && offset !== undefined; page++) {
+      mockClient.searchByName.mockResolvedValueOnce(all);
+      const ctx = createMockContext({ errors: searchCompounds.errors });
+      const result = await searchCompounds.handler(
+        searchCompounds.input.parse({
+          searchType: 'identifier',
+          identifierType: 'name',
+          identifiers: ['aspirin'],
+          offset,
+          maxResults: 2,
+        }),
+        ctx,
+      );
+      collected.push(...result.results.map((r) => r.cid));
+      offset = getEnrichment(ctx).nextOffset as number | undefined;
+    }
+
+    expect(collected).toEqual(all);
+  });
+
+  it('emits an integer nextOffset even when maxResults is fractional (#44)', async () => {
+    /* The schema rejects a fractional cap, so this drives the handler directly to guard the
+     * stride derivation itself: taking it from the cap rather than from the returned page
+     * would reopen the dead end regardless of what the schema accepts. */
+    mockClient.searchByName.mockResolvedValueOnce([10, 20, 30, 40]);
+    const ctx = createMockContext({ errors: searchCompounds.errors });
+    const input = {
+      ...searchCompounds.input.parse({
+        searchType: 'identifier',
+        identifierType: 'name',
+        identifiers: ['aspirin'],
+      }),
+      maxResults: 2.5,
+    };
+    await searchCompounds.handler(input, ctx);
+    const nextOffset = getEnrichment(ctx).nextOffset as number;
+
+    // Stride comes from the page returned, so the tool's own integer offset validator accepts it.
+    expect(Number.isInteger(nextOffset)).toBe(true);
+    expect(() =>
+      searchCompounds.input.parse({
+        searchType: 'identifier',
+        identifierType: 'name',
+        identifiers: ['aspirin'],
+        offset: nextOffset,
+      }),
+    ).not.toThrow();
+  });
+
+  it('rejects a negative, fractional, or out-of-range offset', () => {
+    const base = { searchType: 'formula', formula: 'C6H12O6' };
+    expect(() => searchCompounds.input.parse({ ...base, offset: -1 })).toThrow();
+    expect(() => searchCompounds.input.parse({ ...base, offset: 1.5 })).toThrow();
+    expect(() => searchCompounds.input.parse({ ...base, offset: 10001 })).toThrow();
+    expect(() => searchCompounds.input.parse({ ...base, offset: 10000 })).not.toThrow();
+  });
+});

@@ -1,0 +1,47 @@
+"@context": https://schema.org
+"@type": SoftwareApplication
+"@id": https://github.com/effieklimi/ensembl-mcp-server
+
+identifier: effieklimi/ensembl-mcp-server
+
+name: Ensembl API MCP Server
+
+description: >
+  A full-featured Model Context Protocol (MCP) server that exposes Ensembl’s REST API.
+
+codeRepository: https://github.com/effieklimi/ensembl-mcp-server
+
+softwareHelp:
+  "@type": CreativeWork
+  url: https://github.com/effieklimi/ensembl-mcp-server/blob/main/README.md
+  name: Documentation
+
+maintainer:
+  - "@type": Person
+    name: Effie Klimi
+    identifier: effieklimi
+    url: https://github.com/effieklimi
+
+license: https://spdx.org/licenses/MIT.html
+
+applicationCategory: HealthApplication
+
+keywords:
+  - Ensembl
+
+featureList:
+  - Lookup
+  - Variation
+  - Comparative genomics
+  - Ontology search
+  - Sequences
+  - Overlap
+
+datePublished: "2025-06-11"
+
+operatingSystem:
+  - Cross-platform
+
+programmingLanguage:
+  - JavaScript
+  - TypeScript

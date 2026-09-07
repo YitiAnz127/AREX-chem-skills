@@ -1,0 +1,44 @@
+"@context": https://schema.org
+"@type": SoftwareApplication
+"@id": https://github.com/cyanheads/clinicaltrialsgov-mcp-server
+
+identifier: cyanheads/clinicaltrialsgov-mcp-server
+
+name: ClinicalTrials.gov MCP Server
+
+description: >
+  Model Context Protocol (MCP) Server providing a robust, developer-friendly interface to the official
+  ClinicalTrials.gov v2 API. Enables LLMs and AI agents to search, retrieve, and analyze clinical study
+  data programmatically.
+
+codeRepository: https://github.com/cyanheads/clinicaltrialsgov-mcp-server
+
+softwareHelp:
+  "@type": CreativeWork
+  url: https://www.npmjs.com/package/clinicaltrialsgov-mcp-server
+  name: Documentation
+
+maintainer:
+  - "@type": Person
+    name: Casey Hand
+    identifier: cyanheads
+    url: https://github.com/cyanheads
+
+license: https://spdx.org/licenses/Apache-2.0.html
+
+applicationCategory: HealthApplication
+
+keywords:
+  - ClinicalTrials.gov
+  - Clinical studies
+
+featureList:
+  - ClinicalTrials.gov
+
+datePublished: "2025-08-01"
+
+operatingSystem:
+  - Cross-platform
+
+programmingLanguage:
+  - TypeScript

@@ -1,0 +1,453 @@
+"""Tests for render() and turntable()."""
+
+import os
+import re
+import struct
+import zlib
+from unittest.mock import patch
+
+import pytest
+from mcp.server.fastmcp import Image
+
+from mcpymol.rendering import _PNG_EOF, _read_complete_png, render, turntable
+
+
+def _png_bytes(width=8, height=8):
+    """A real, minimal, valid PNG with varied pixels.
+
+    Varied deliberately: a flat image is what a *failed* render looks like, so
+    a uniform stub would be indistinguishable from the blank-image bug.
+    """
+
+    def chunk(tag, data):
+        return (
+            struct.pack(">I", len(data))
+            + tag
+            + data
+            + struct.pack(">I", zlib.crc32(tag + data) & 0xFFFFFFFF)
+        )
+
+    raw = b"".join(
+        b"\x00"
+        + b"".join(
+            bytes(((x * 7) % 256, (y * 11) % 256, ((x + y) * 13) % 256)) for x in range(width)
+        )
+        for y in range(height)
+    )
+    return (
+        b"\x89PNG\r\n\x1a\n"
+        + chunk(b"IHDR", struct.pack(">IIBBBBB", width, height, 8, 2, 0, 0, 0))
+        + chunk(b"IDAT", zlib.compress(raw))
+        + chunk(b"IEND", b"")
+    )
+
+
+def _writes_png(path_holder, data=None):
+    """send_request side effect that writes a PNG where PyMOL was asked to."""
+
+    def fake(action, args=None, kwargs=None, **_ignored):
+        if action == "png" and args:
+            path_holder.append(args[0])
+            with open(args[0], "wb") as fh:
+                fh.write(data if data is not None else _png_bytes())
+        return {"status": "success", "result": "OK"}
+
+    return fake
+
+
+# ── _read_complete_png ───────────────────────────────────────────────────────
+
+
+def test_read_complete_png_returns_bytes(tmp_path):
+    p = tmp_path / "x.png"
+    p.write_bytes(_png_bytes())
+
+    assert _read_complete_png(str(p)) == _png_bytes()
+
+
+def test_read_complete_png_rejects_a_truncated_file(tmp_path):
+    """A half-written PNG must not be handed back as an image."""
+    p = tmp_path / "x.png"
+    p.write_bytes(_png_bytes()[:-20])  # no IEND yet
+
+    assert _read_complete_png(str(p), timeout=0.2) is None
+
+
+def test_read_complete_png_times_out_when_absent(tmp_path):
+    assert _read_complete_png(str(tmp_path / "never.png"), timeout=0.2) is None
+
+
+def test_png_eof_constant_matches_a_real_png():
+    assert _png_bytes().endswith(_PNG_EOF)
+
+
+# ── render ───────────────────────────────────────────────────────────────────
+
+
+@patch("mcpymol.rendering.send_request")
+def test_render_returns_image_content(mock_sr):
+    """The whole point: the model gets pixels back, not a filename."""
+    mock_sr.side_effect = _writes_png([])
+
+    result = render()
+
+    assert isinstance(result, Image)
+    assert result.data == _png_bytes()
+    assert result._mime_type == "image/png"
+
+
+@patch("mcpymol.rendering.send_request")
+def test_render_asks_pymol_to_ray_trace_at_the_requested_size(mock_sr):
+    mock_sr.side_effect = _writes_png([])
+
+    render(width=640, height=480)
+
+    kwargs = mock_sr.call_args.kwargs["kwargs"]
+    assert kwargs == {"width": 640, "height": 480, "ray": 1}
+    assert mock_sr.call_args.args[0] == "png"
+
+
+@patch("mcpymol.rendering.send_request")
+def test_render_ignores_a_request_to_skip_ray_tracing(mock_sr):
+    """See test_render_always_ray_traces — ray=0 is blank over the bridge."""
+    mock_sr.side_effect = _writes_png([])
+
+    render(ray_trace=False)
+
+    assert mock_sr.call_args.kwargs["kwargs"]["ray"] == 1
+
+
+@patch("mcpymol.rendering.send_request")
+def test_render_uses_the_slow_timeout(mock_sr):
+    """A 1920x1080 trace does not finish inside the 10 s interactive budget."""
+    from mcpymol.bridge import _SLOW_OP_TIMEOUT
+
+    mock_sr.side_effect = _writes_png([])
+
+    render()
+
+    assert mock_sr.call_args.kwargs["timeout"] == _SLOW_OP_TIMEOUT
+
+
+@patch("mcpymol.rendering.send_request")
+def test_render_cleans_up_its_temp_file(mock_sr):
+    seen: list[str] = []
+    mock_sr.side_effect = _writes_png(seen)
+
+    render()
+
+    assert seen, "png was never requested"
+    assert not os.path.exists(seen[0]), "temporary render was left behind"
+
+
+@patch("mcpymol.rendering.send_request")
+def test_render_keeps_a_named_file(mock_sr, tmp_path):
+    target = tmp_path / "nested" / "shot.png"
+    mock_sr.side_effect = _writes_png([])
+
+    result = render(filename=str(target))
+
+    assert isinstance(result, Image)
+    assert target.exists(), "named output should be kept"
+
+
+@patch("mcpymol.rendering.send_request")
+def test_render_reports_pymol_errors(mock_sr):
+    mock_sr.return_value = {"status": "error", "error": "no objects to render"}
+
+    result = render()
+
+    assert isinstance(result, str)
+    assert "no objects to render" in result
+
+
+@patch("mcpymol.rendering.send_request")
+def test_render_reports_a_missing_file(mock_sr):
+    """PyMOL claiming success without writing means the halves are split
+    across machines — say so rather than returning a broken image."""
+    mock_sr.return_value = {"status": "success", "result": "OK"}
+
+    with patch("mcpymol.rendering._PNG_APPEAR_TIMEOUT", 0.2):
+        result = render()
+
+    assert isinstance(result, str)
+    assert "no complete PNG appeared" in result
+
+
+@patch("mcpymol.rendering.send_request")
+def test_render_refuses_to_inline_a_huge_image(mock_sr, tmp_path):
+    """Base64 inflates by a third; a 40 MB render would swamp the context."""
+    big = _png_bytes()
+    mock_sr.side_effect = _writes_png([], data=big)
+
+    with patch("mcpymol.rendering.MAX_INLINE_IMAGE_BYTES", 10):
+        result = render(filename=str(tmp_path / "big.png"))
+
+    assert isinstance(result, str)
+    assert "too large to return inline" in result
+    assert "smaller width/height" in result
+
+
+@patch("mcpymol.rendering.send_request")
+def test_render_keeps_an_oversized_render_that_went_to_a_temp_file(mock_sr):
+    """The oversize reply names the file it is at, so that file has to still
+    be there. It used to be unlinked on the way out when no filename was
+    given, which threw away a render that had just cost minutes and left the
+    caller chasing a path that no longer existed."""
+    mock_sr.side_effect = _writes_png([], data=_png_bytes())
+
+    with patch("mcpymol.rendering.MAX_INLINE_IMAGE_BYTES", 10):
+        result = render()
+
+    assert isinstance(result, str)
+    assert "too large to return inline" in result
+
+    reported = re.search(r"It is at (\S+?)\.\s", result)
+    assert reported, f"no path in the reply: {result}"
+    path = reported.group(1)
+    assert os.path.exists(path), f"reply points at {path}, which was deleted"
+    os.unlink(path)
+
+
+@pytest.mark.parametrize("w,h", [(0, 100), (100, 0), (-5, 100)])
+@patch("mcpymol.rendering.send_request")
+def test_render_rejects_nonsense_dimensions(mock_sr, w, h):
+    result = render(width=w, height=h)
+
+    assert isinstance(result, str)
+    assert "must be positive" in result
+    mock_sr.assert_not_called()
+
+
+# ── turntable ────────────────────────────────────────────────────────────────
+
+
+@patch("mcpymol.rendering.send_request")
+def test_turntable_writes_one_frame_per_step(mock_sr, tmp_path):
+    mock_sr.return_value = {"status": "success", "result": "OK"}
+
+    result = turntable(obj_name="1abc", frames=4, out_dir=str(tmp_path))
+
+    png_calls = [c for c in mock_sr.call_args_list if c.args[0] == "png"]
+    assert len(png_calls) == 4
+    assert [os.path.basename(c.kwargs["args"][0]) for c in png_calls] == [
+        "turntable_0000.png",
+        "turntable_0001.png",
+        "turntable_0002.png",
+        "turntable_0003.png",
+    ]
+    assert "Wrote 4 ray-traced frames" in result
+
+
+@patch("mcpymol.rendering.send_request")
+def test_turntable_rotates_a_full_circle(mock_sr, tmp_path):
+    """N frames must span exactly 360°, with no rotation before the first."""
+    mock_sr.return_value = {"status": "success", "result": "OK"}
+
+    turntable(frames=8, out_dir=str(tmp_path))
+
+    turns = [c for c in mock_sr.call_args_list if c.args[0] == "turn"]
+    assert len(turns) == 7, "the first frame is the starting orientation"
+    steps = [float(c.kwargs["args"][1]) for c in turns]
+    assert all(s == 45.0 for s in steps)
+    assert sum(steps) == 315.0  # the 8th step would close the loop
+
+
+@patch("mcpymol.rendering.send_request")
+def test_turntable_sets_the_rotation_origin(mock_sr, tmp_path):
+    """Without this the model orbits the scene centre and appears to wobble."""
+    mock_sr.return_value = {"status": "success", "result": "OK"}
+
+    turntable(obj_name="1abc", frames=2, out_dir=str(tmp_path))
+
+    dos = [c.kwargs["args"][0] for c in mock_sr.call_args_list if c.args[0] == "do"]
+    assert "origin 1abc" in dos
+
+
+@patch("mcpymol.rendering.send_request")
+def test_turntable_ray_traces_by_default(mock_sr, tmp_path):
+    """The old default was the OpenGL path, which writes blank frames here."""
+    mock_sr.return_value = {"status": "success", "result": "OK"}
+
+    turntable(frames=3, out_dir=str(tmp_path))
+
+    for c in mock_sr.call_args_list:
+        if c.args[0] == "png":
+            assert c.kwargs["kwargs"]["ray"] == 1
+
+
+@patch("mcpymol.rendering.send_request")
+def test_turntable_can_ray_trace(mock_sr, tmp_path):
+    mock_sr.return_value = {"status": "success", "result": "OK"}
+
+    result = turntable(frames=3, out_dir=str(tmp_path), ray_trace=True)
+
+    assert all(c.kwargs["kwargs"]["ray"] == 1 for c in mock_sr.call_args_list if c.args[0] == "png")
+    assert "ray-traced" in result
+
+
+@patch("mcpymol.rendering.send_request")
+def test_turntable_stops_on_a_write_error(mock_sr, tmp_path):
+    def fake(action, args=None, kwargs=None, **_ignored):
+        if action == "png":
+            return {"status": "error", "error": "disk full"}
+        return {"status": "success", "result": "OK"}
+
+    mock_sr.side_effect = fake
+
+    result = turntable(frames=5, out_dir=str(tmp_path))
+
+    assert "Error writing frame 0" in result
+    assert "disk full" in result
+
+
+@patch("mcpymol.rendering.send_request")
+def test_turntable_rejects_too_few_frames(mock_sr):
+    assert "at least 2" in turntable(frames=1)
+    mock_sr.assert_not_called()
+
+
+@patch("mcpymol.rendering.send_request")
+def test_turntable_creates_the_output_directory(mock_sr, tmp_path):
+    mock_sr.return_value = {"status": "success", "result": "OK"}
+    target = tmp_path / "frames" / "run1"
+
+    turntable(frames=2, out_dir=str(target))
+
+    assert target.is_dir()
+
+
+# ── scene background ─────────────────────────────────────────────────────────
+
+
+def test_black_background_sets_both_settings():
+    """bg_color alone leaves an alpha channel, so a ray-traced PNG comes out
+    transparent — which reads as white wherever the image is used. Every view
+    preset except the ghost-heart style had exactly that bug."""
+    from mcpymol.style import black_background
+
+    with patch("mcpymol.style.send_request") as mock_sr:
+        mock_sr.return_value = {"status": "success", "result": "OK"}
+        black_background()
+
+    calls = [(c.args[0], tuple(c.kwargs["args"])) for c in mock_sr.call_args_list]
+    assert ("do", ("bg_color black",)) in calls
+    assert ("set", ("opaque_background", "1")) in calls
+
+
+def test_no_view_sets_a_background_without_making_it_opaque():
+    """Guards the whole class of bug rather than one instance: a preset that
+    reaches for bg_color directly has skipped the opaque_background half."""
+    import pathlib
+
+    src = pathlib.Path(__file__).resolve().parent.parent / "src" / "mcpymol"
+    offenders = [
+        path.name
+        for path in src.glob("*.py")
+        if path.name != "style.py" and 'args=["bg_color' in path.read_text()
+    ]
+
+    assert not offenders, (
+        f"{offenders} set bg_color directly; use style.set_background() so the "
+        f"render is actually opaque"
+    )
+
+
+def test_a_non_black_background_is_also_made_opaque():
+    """textbook_view wants white, not black — and had the identical bug."""
+    from mcpymol.style import set_background
+
+    with patch("mcpymol.style.send_request") as mock_sr:
+        mock_sr.return_value = {"status": "success", "result": "OK"}
+        set_background("white")
+
+    calls = [(c.args[0], tuple(c.kwargs["args"])) for c in mock_sr.call_args_list]
+    assert ("do", ("bg_color white",)) in calls
+    assert ("set", ("opaque_background", "1")) in calls
+
+
+# ── the OpenGL path does not work over the bridge ────────────────────────────
+
+
+def _flat_png(width=4, height=4):
+    """A PNG of a single colour — what PyMOL's OpenGL capture writes when it
+    runs off the GUI thread."""
+    import struct
+    import zlib
+
+    def chunk(tag, data):
+        return (
+            struct.pack(">I", len(data))
+            + tag
+            + data
+            + struct.pack(">I", zlib.crc32(tag + data) & 0xFFFFFFFF)
+        )
+
+    raw = b"".join(b"\x00" + b"\x00\x00\x00" * width for _ in range(height))
+    return (
+        b"\x89PNG\r\n\x1a\n"
+        + chunk(b"IHDR", struct.pack(">IIBBBBB", width, height, 8, 2, 0, 0, 0))
+        + chunk(b"IDAT", zlib.compress(raw))
+        + chunk(b"IEND", b"")
+    )
+
+
+def test_looks_blank_detects_a_flat_image():
+    from mcpymol.rendering import _looks_blank
+
+    assert _looks_blank(_flat_png()) is True
+
+
+def test_looks_blank_passes_a_real_render():
+    from mcpymol.rendering import _looks_blank
+
+    assert _looks_blank(_png_bytes()) is False
+
+
+def test_looks_blank_survives_a_corrupt_png():
+    from mcpymol.rendering import _looks_blank
+
+    assert _looks_blank(b"\x89PNG\r\n\x1a\ngarbage") is False
+
+
+@patch("mcpymol.rendering.send_request")
+def test_render_always_ray_traces(mock_sr):
+    """ray_trace=False silently produced a blank image: PyMOL's OpenGL capture
+    needs its GUI thread and the plugin dispatches on a socket thread."""
+    mock_sr.side_effect = _writes_png([])
+
+    render(ray_trace=False)
+
+    assert mock_sr.call_args.kwargs["kwargs"]["ray"] == 1
+
+
+@patch("mcpymol.rendering.send_request")
+def test_render_reports_a_blank_image(mock_sr):
+    mock_sr.side_effect = _writes_png([], data=_flat_png())
+
+    result = render()
+
+    assert isinstance(result, str)
+    assert "single flat colour" in result
+    assert "count_atoms" in result
+
+
+@patch("mcpymol.rendering.send_request")
+def test_render_explains_why_it_ignored_ray_trace_false(mock_sr):
+    mock_sr.side_effect = _writes_png([], data=_flat_png())
+
+    result = render(ray_trace=False)
+
+    assert "GUI thread" in result
+
+
+@patch("mcpymol.rendering.send_request")
+def test_turntable_always_ray_traces(mock_sr, tmp_path):
+    """Its default used to be the broken path, so every frame came out blank."""
+    mock_sr.return_value = {"status": "success", "result": "OK"}
+
+    turntable(frames=3, out_dir=str(tmp_path), ray_trace=False)
+
+    for call in mock_sr.call_args_list:
+        if call.args[0] == "png":
+            assert call.kwargs["kwargs"]["ray"] == 1

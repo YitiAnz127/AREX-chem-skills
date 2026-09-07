@@ -1,0 +1,41 @@
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+
+# Virtual environments
+.venv/
+venv/
+env/
+refresh/
+
+# Editor / OS / local agent artifacts
+.DS_Store
+.idea/
+.vscode/
+.claude/*
+!.claude/skills/
+.gemini/
+
+# Build artifacts
+build/
+dist/
+
+# Project stubs / leftovers
+main.py
+*.mc
+
+# Structural data (downloaded on demand)
+*.pdb
+*.cif
+*.mmtf
+
+# Media (keep README assets)
+*.mp4
+*.gif
+*.png
+!assets/*.png
+!assets/*.gif

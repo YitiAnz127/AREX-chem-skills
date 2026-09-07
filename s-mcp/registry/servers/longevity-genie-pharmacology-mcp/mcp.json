@@ -1,0 +1,8 @@
+{
+  "mcpServers": {
+    "longevity-genie/pharmacology-mcp": {
+      "command": "uvx",
+      "args": ["--with", "mcp==1.23.0", "pharmacology-mcp", "stdio"]
+    }
+  }
+}

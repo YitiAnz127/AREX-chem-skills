@@ -1,0 +1,25 @@
+biopython>=1.80
+codecov
+cython
+filelock
+griddataformats
+gsd
+hypothesis
+joblib>=0.12
+matplotlib
+mmtf-python
+netcdf4
+networkx
+numpy>=1.23.2
+packaging
+parmed
+pooch
+pytest
+scikit-learn
+scipy
+seaborn>=0.7.0,<=0.9
+sphinx <7.0
+mdanalysis_sphinx_theme >=1.0.1
+sphinx_sitemap
+threadpoolctl
+tqdm

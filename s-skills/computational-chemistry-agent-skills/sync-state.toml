@@ -1,0 +1,67 @@
+version = 1
+
+[jobs]
+[jobs."create-skill"]
+last_upstream_commit = "0934c552d7b2aa5be3378e0d53fdadd134c7f4ce"
+last_upstream_ref = "master"
+updated_at = "2026-03-23T11:09:52.783767+00:00"
+
+[jobs."deepmd-finetune-dpa3"]
+last_upstream_commit = "65c04205a1509df8bb1ce75702a5e3dda1613e95"
+last_upstream_ref = "master"
+updated_at = "2026-06-03T14:01:38.375681+00:00"
+
+[jobs."deepmd-python-inference"]
+last_upstream_commit = "65c04205a1509df8bb1ce75702a5e3dda1613e95"
+last_upstream_ref = "master"
+updated_at = "2026-06-03T14:01:47.440654+00:00"
+
+[jobs."deepmd-train"]
+last_upstream_commit = "1050e46ca645c866bbbc327cc8f8d938cfa82371"
+last_upstream_ref = "master"
+updated_at = "2026-06-19T07:35:00+00:00"
+
+[jobs."dpdata-cli"]
+last_upstream_commit = "85ae95d3396eb01bcdb25eb399928bf48872900f"
+last_upstream_ref = "master"
+updated_at = "2026-08-20T18:28:42.800647+00:00"
+
+[jobs."dpdata-driver"]
+last_upstream_commit = "32febda08e269a512db61ff1f4dcf193be29bef8"
+last_upstream_ref = "master"
+updated_at = "2026-03-25T11:34:53.749356+00:00"
+
+[jobs."dpdata-minimizer"]
+last_upstream_commit = "32febda08e269a512db61ff1f4dcf193be29bef8"
+last_upstream_ref = "master"
+updated_at = "2026-03-25T11:34:56.449573+00:00"
+
+[jobs."dpdisp-submit"]
+last_upstream_commit = "b7a3b1266fa67e6c21aff2fac276946225171329"
+last_upstream_ref = "master"
+updated_at = "2026-03-25T11:34:42.883004+00:00"
+
+[jobs."dpgen-simplify"]
+last_upstream_commit = "a8d60bac18cede01c8e8afed06bbffee68d93b76"
+last_upstream_ref = "master"
+updated_at = "2026-05-08T08:52:44.584596+00:00"
+
+[jobs."lammps-deepmd"]
+last_upstream_commit = "5156c408b817342d190b67b6f0d922447663e5d5"
+last_upstream_ref = "master"
+updated_at = "2026-05-08T08:53:34.085745+00:00"
+
+[jobs."reacnetgenerator"]
+last_upstream_commit = "84612a228a0c47ba4c22caef7942b30e20aa18dd"
+last_upstream_ref = "master"
+updated_at = "2026-05-08T08:52:51.560676+00:00"
+
+[jobs."xtbloom-integrate-ase-dpdata"]
+last_upstream_commit = "32b1c76ca225ae151f6650723a892056b7a6cf6d"
+last_upstream_ref = "main"
+updated_at = "2026-08-14T00:40:17.434047+00:00"
+
+[jobs."xtbloom-run-python-inference"]
+last_upstream_commit = "45af658f666af287a5f81f9122502be20d0062c2"
+last_upstream_ref = "main"
+updated_at = "2026-08-20T18:29:30.199287+00:00"

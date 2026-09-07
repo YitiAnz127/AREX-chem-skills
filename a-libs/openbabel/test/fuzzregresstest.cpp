@@ -1,0 +1,872 @@
+/**********************************************************************
+fuzzregresstest.cpp - Regression tests for previously crashing inputs.
+
+Each test case loads a saved fuzzer reproducer (typically from OSS-Fuzz
+or a CVE report) and runs it through OBConversion. The test passes as
+long as the read returns cleanly. Run under ASAN/UBSAN to catch the
+original memory-safety issue if it regresses.
+
+Add new cases by:
+  1. Saving the minimized reproducer to test/files/fuzz_regress/
+     using the naming convention cve-YYYY-NNNNN.<ext>
+  2. Adding a case<N>() function below
+  3. Registering it in the switch and incrementing
+     fuzzregresstest_parts in test/CMakeLists.txt
+
+Copyright (C) 2026 by the Open Babel project.
+
+This file is part of the Open Babel project.
+For more information, see <http://openbabel.org/>
+
+This program is free software; you can redistribute it and/or modify
+it under the terms of the GNU General Public License as published by
+the Free Software Foundation version 2 of the License.
+
+This program is distributed in the hope that it will be useful,
+but WITHOUT ANY WARRANTY; without even the implied warranty of
+MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+GNU General Public License for more details.
+***********************************************************************/
+
+#include "obtest.h"
+#include <openbabel/babelconfig.h>
+#include <openbabel/mol.h>
+#include <openbabel/obconversion.h>
+#include <openbabel/plugin.h>
+
+#include <fstream>
+#include <sstream>
+#include <string>
+#include <vector>
+
+using namespace std;
+using namespace OpenBabel;
+
+static string GetFuzzFile(const string &filename)
+{
+  return string(TESTDATADIR) + "fuzz_regress/" + filename;
+}
+
+// Run a single reproducer through the named input format. We don't care
+// whether the read succeeds or fails; we only require that it returns
+// without crashing. Skip silently if the corpus file isn't available
+// (e.g. submodule not checked out), so the test is non-fatal in that
+// environment but still meaningful in CI where the file is present.
+static bool RunRepro(const string &cveId, const string &inFormat,
+                     const string &filename)
+{
+  string path = GetFuzzFile(filename);
+  ifstream probe(path.c_str());
+  if (!probe.good()) {
+    cout << "# skip " << cveId << ": corpus file missing (" << path << ")\n";
+    return true;
+  }
+
+  OBConversion conv;
+  if (!conv.SetInFormat(inFormat.c_str())) {
+    cout << "# skip " << cveId << ": format " << inFormat
+         << " not registered in this build\n";
+    return true;
+  }
+
+  OBMol mol;
+  // ReadFile may return true or false; both are fine. The point is the
+  // sanitizer must not fire while parsing this previously-crashing input.
+  conv.ReadFile(&mol, path);
+  return true;
+}
+
+// Read a reproducer in one format and round-trip it through a writer
+// in another format. As with RunRepro, success or failure of the read
+// or write is irrelevant -- the goal is to ensure neither path crashes
+// or trips a sanitizer.
+static bool RunReproConvert(const string &caseId, const string &inFormat,
+                            const string &outFormat, const string &filename)
+{
+  string path = GetFuzzFile(filename);
+  ifstream probe(path.c_str());
+  if (!probe.good()) {
+    cout << "# skip " << caseId << ": corpus file missing (" << path << ")\n";
+    return true;
+  }
+
+  OBConversion conv;
+  if (!conv.SetInFormat(inFormat.c_str())) {
+    cout << "# skip " << caseId << ": input format " << inFormat
+         << " not registered in this build\n";
+    return true;
+  }
+  if (!conv.SetOutFormat(outFormat.c_str())) {
+    cout << "# skip " << caseId << ": output format " << outFormat
+         << " not registered in this build\n";
+    return true;
+  }
+
+  OBMol mol;
+  if (!conv.ReadFile(&mol, path))
+    return true;
+
+  ostringstream out;
+  conv.Write(&mol, &out);
+  return true;
+}
+
+// Like RunRepro but sets one INOPTION flag before reading.  Needed for
+// formats that gate a code path behind a conversion option (e.g. mol2 -c).
+static bool RunReproWithInputFlag(const string &cveId, const string &inFormat,
+                                  const string &filename, const string &flag)
+{
+  string path = GetFuzzFile(filename);
+  ifstream probe(path.c_str());
+  if (!probe.good()) {
+    cout << "# skip " << cveId << ": corpus file missing (" << path << ")\n";
+    return true;
+  }
+
+  OBConversion conv;
+  if (!conv.SetInFormat(inFormat.c_str())) {
+    cout << "# skip " << cveId << ": format " << inFormat
+         << " not registered in this build\n";
+    return true;
+  }
+  conv.AddOption(flag.c_str(), OBConversion::INOPTIONS);
+
+  OBMol mol;
+  conv.ReadFile(&mol, path);
+  return true;
+}
+
+// Read a reproducer that contains a *truncated required record* and require
+// that the parser rejects it (ReadFile returns false) rather than silently
+// accepting it with fabricated field values copied from stale stack memory or
+// from the previous record. This is the observable behaviour of the fixed-
+// width / sscanf hardening: a sanitizer alone would not catch reuse of
+// already-initialized stack memory, so we assert on the rejection instead.
+// Skip silently if the corpus file or format is unavailable.
+static bool RunReproExpectReject(const string &caseId, const string &inFormat,
+                                 const string &filename)
+{
+  string path = GetFuzzFile(filename);
+  ifstream probe(path.c_str());
+  if (!probe.good()) {
+    cout << "# skip " << caseId << ": corpus file missing (" << path << ")\n";
+    return true;
+  }
+
+  OBConversion conv;
+  if (!conv.SetInFormat(inFormat.c_str())) {
+    cout << "# skip " << caseId << ": format " << inFormat
+         << " not registered in this build\n";
+    return true;
+  }
+
+  OBMol mol;
+  if (conv.ReadFile(&mol, path)) {
+    cout << "# FAIL " << caseId << ": truncated record was accepted ("
+         << mol.NumAtoms() << " atoms)\n";
+    return false;
+  }
+  return true;
+}
+
+// Read a reproducer that is *well-formed* and require that it still parses
+// into the expected molecule. Used to pin the accept-side behaviour of a
+// hardening fix: bounds checks that are too aggressive would silently drop
+// good atoms/bonds, which no sanitizer and no "must not crash" test can see.
+// Skip silently if the corpus file or format is unavailable.
+static bool RunReproExpectMolecule(const string &caseId, const string &inFormat,
+                                   const string &filename,
+                                   unsigned int expectedAtoms,
+                                   unsigned int expectedBonds)
+{
+  string path = GetFuzzFile(filename);
+  ifstream probe(path.c_str());
+  if (!probe.good()) {
+    cout << "# skip " << caseId << ": corpus file missing (" << path << ")\n";
+    return true;
+  }
+
+  OBConversion conv;
+  if (!conv.SetInFormat(inFormat.c_str())) {
+    cout << "# skip " << caseId << ": format " << inFormat
+         << " not registered in this build\n";
+    return true;
+  }
+
+  OBMol mol;
+  if (!conv.ReadFile(&mol, path)) {
+    cout << "# FAIL " << caseId << ": valid file was rejected\n";
+    return false;
+  }
+  if (mol.NumAtoms() != expectedAtoms || mol.NumBonds() != expectedBonds) {
+    cout << "# FAIL " << caseId << ": expected " << expectedAtoms << " atoms / "
+         << expectedBonds << " bonds, got " << mol.NumAtoms() << " / "
+         << mol.NumBonds() << "\n";
+    return false;
+  }
+  return true;
+}
+
+// CVE-2026-2704: heap-buffer-overflow in transform3d::DescribeAsString
+// when parsing a CIF with an all-zero row in a space-group transform.
+// Fixed in PR #2862.
+void caseCVE_2026_2704()
+{
+  OB_ASSERT(RunRepro("CVE-2026-2704", "cif", "cve-2026-2704.cif"));
+}
+
+// CVE-2026-2705: NULL pointer dereference in OBAtom::SetFormalCharge via
+// MOL2Format::ReadMolecule with an out-of-range UNITY_ATOM_ATTR id.
+// Fixed in PR #2862.
+void caseCVE_2026_2705()
+{
+  OB_ASSERT(RunRepro("CVE-2026-2705", "mol2", "cve-2026-2705.mol2"));
+}
+
+// CVE-2026-3408: NULL pointer dereference in
+// ChemDrawXMLFormat::EndElement when fragment atom indices fail to
+// resolve. Fixed in PR #2862.
+void caseCVE_2026_3408()
+{
+  OB_ASSERT(RunRepro("CVE-2026-3408", "cdxml", "cve-2026-3408.cdxml"));
+}
+
+// ANT-2026-00770: crash when writing a star-shaped molecule (one
+// central atom bonded to seven peripheral atoms) as MCDL. Read the
+// MOL/SDF reproducer and exercise the MCDL writer.
+void caseANT_2026_00770()
+{
+  OB_ASSERT(RunReproConvert("ANT-2026-00770", "sdf", "mcdl",
+                            "ant-2026-00770.sdf"));
+}
+
+// trailofbits-2026: cascade of MCDL parser bugs reachable from a single
+// {CZ:201,1+} entry. The original report was a heap-buffer-overflow
+// at charges[n2-1] (fixed in 1f11fb7b9). The bounds check unmasked an
+// infinite loop in the same charge/radical parser, an std::out_of_range
+// from parseFormula, and a BUS write in the bond-fragment parser - all
+// instances of the same unsigned-vs-signed indexOf() pattern. Reader
+// must now return cleanly without hang, exception, or memory error.
+void caseTrailOfBits_2026()
+{
+  OB_ASSERT(RunRepro("trailofbits-2026", "mcdl", "trailofbits-2026.mcdl"));
+}
+
+// CVE-2022-46291: out-of-bounds write into a fixed 3-element
+// translationVectors[] in GaussianOutputFormat when the orientation
+// block contains more than three atomicNum=-2 (Tv) rows.
+void caseCVE_2022_46291()
+{
+  OB_ASSERT(RunRepro("CVE-2022-46291", "g09", "cve-2022-46291.g09"));
+}
+
+// CVE-2022-46292: out-of-bounds write into translationVectors[] in
+// MOPACFormat when the "UNIT CELL TRANSLATION" block contains more
+// than three lattice-vector rows.
+void caseCVE_2022_46292()
+{
+  OB_ASSERT(RunRepro("CVE-2022-46292", "mopout", "cve-2022-46292.out"));
+}
+
+// CVE-2022-46293: out-of-bounds write into translationVectors[] in
+// MOPACFormat when the "FINAL POINT AND DERIVATIVES" block contains
+// more than three Tv-atom Z-component rows.
+void caseCVE_2022_46293()
+{
+  OB_ASSERT(RunRepro("CVE-2022-46293", "mopout", "cve-2022-46293.out"));
+}
+
+// CVE-2022-46294: out-of-bounds write into translationVectors[] in
+// MOPACCARTFormat when the input contains more than three Tv-element
+// atom rows.
+void caseCVE_2022_46294()
+{
+  OB_ASSERT(RunRepro("CVE-2022-46294", "mop", "cve-2022-46294.mop"));
+}
+
+// CVE-2022-46295: out-of-bounds write into translationVectors[] in
+// MSIFormat when a PeriodicType record is followed by more than
+// three lattice-vector lines.
+void caseCVE_2022_46295()
+{
+  OB_ASSERT(RunRepro("CVE-2022-46295", "msi", "cve-2022-46295.msi"));
+}
+
+// CVE-2022-46289: out-of-bounds write into the confCoords[] heap
+// buffer in OrcaOutputFormat when the "Number of atoms" header
+// understates the row count of the following CARTESIAN COORDINATES
+// (ANGSTROEM) block.
+void caseCVE_2022_46289()
+{
+  OB_ASSERT(RunRepro("CVE-2022-46289", "orca", "cve-2022-46289.out"));
+}
+
+// CVE-2022-46290: out-of-bounds write in OrcaOutputFormat reachable
+// via a malformed "Number of atoms" value (e.g. negative) that
+// previously skipped the confCoords[] bounds check.
+void caseCVE_2022_46290()
+{
+  OB_ASSERT(RunRepro("CVE-2022-46290", "orca", "cve-2022-46290.out"));
+}
+
+// CVE-2022-42885: uninitialized OBResidue* in GROFormat::WriteMolecule
+// when the molecule has no residue information (e.g. read from XYZ).
+// The write path dereferenced `res` without a null check.
+void caseCVE_2022_42885()
+{
+  OB_ASSERT(RunReproConvert("CVE-2022-42885", "xyz", "gro",
+                            "cve-2022-42885.xyz"));
+}
+
+// CVE-2022-44451: uninitialized OBAtom* in MSIFormat::ReadMolecule
+// when an atom record contains an XYZ line before the ACL line that
+// allocates the atom object.
+void caseCVE_2022_44451()
+{
+  OB_ASSERT(RunRepro("CVE-2022-44451", "msi", "cve-2022-44451.msi"));
+}
+
+// CVE-2022-46280: uninitialized OBFormat* in PQSFormat::ReadMolecule
+// when a "geom file=" line references an external file whose suffix
+// does not match any of the recognized =car/=hin/=pdb/=mop patterns,
+// leaving pFormat garbage before the dispatch call.
+void caseCVE_2022_46280()
+{
+  OB_ASSERT(RunRepro("CVE-2022-46280", "pqs", "cve-2022-46280.pqs"));
+}
+
+// CVE-2022-43467: out-of-bounds write in PQSFormat::ReadMolecule when
+// a relative "geom file=" name is long enough that the directory prefix
+// copied from the title plus the filename together overflow the 256-byte
+// full_coord_path[] buffer in the strcat() call.
+void caseCVE_2022_43467()
+{
+  OB_ASSERT(RunRepro("CVE-2022-43467", "pqs", "cve-2022-43467.pqs"));
+}
+
+// CVE-2025-10998: NULL dereference in ChemKinFormat::ReadReactionQualifierLines.
+// A qualifier line that tokenizes to empty caused toks[0] to be accessed
+// out-of-bounds; the resulting invalid std::string had _M_data()==nullptr,
+// so the subsequent strcasecmp(toks[0].c_str(),...) SEGVed at address 0x0.
+// Fixed in af4a4212 by adding an upfront toks.empty() early-continue.
+void caseCVE_2025_10998()
+{
+  OB_ASSERT(RunRepro("CVE-2025-10998", "ck", "cve-2025-10998.ck"));
+}
+
+// CVE-2025-10997: heap-buffer-overflow in ChemKinFormat::CheckSpecies via
+// ReadReactionQualifierLines. A "TS" qualifier line with fewer than two
+// tokens caused toks[1] to be accessed out-of-bounds; the resulting garbage
+// std::string was passed to IMols.find(), whose map-node traversal then
+// tripped a heap-buffer-overflow. Fixed in af4a4212 by adding a
+// toks.size()>=2 guard and an upfront toks.empty() early-continue.
+void caseCVE_2025_10997()
+{
+  OB_ASSERT(RunRepro("CVE-2025-10997", "ck", "cve-2025-10997.ck"));
+}
+
+// CVE-2025-10995: memcpy-param-overlap in basic_unzip_streambuf::underflow.
+// When the get pointer is close enough to the start of _buffer, the putback
+// copy destination and source overlap. memcpy has undefined behaviour on
+// overlapping ranges; fixed by replacing it with memmove.
+void caseCVE_2025_10995()
+{
+  OB_ASSERT(RunRepro("CVE-2025-10995", "sdf", "cve-2025-10995.sdf.gz"));
+}
+
+// CVE-2025-10996: heap-buffer-overflow in OBSmilesParser::ParseSmiles when
+// a malformed SMILES string (e.g. from a bracket path) creates atoms that
+// have no corresponding _hcount entry. The loop applied implicit valence
+// using _hcount[idx-1] without checking whether idx-1 is in range.
+// Fixed in b34cd604 by adding an `idx-1 >= _hcount.size()` bounds check.
+void caseCVE_2025_10996()
+{
+  OB_ASSERT(RunRepro("CVE-2025-10996", "smi", "cve-2025-10996.smi"));
+}
+
+// CVE-2025-10999: NULL dereference in CacaoFormat::SetHilderbrandt when
+// atoms are spaced >10 Å apart. The original code used sum=100.0 as a
+// distance² threshold, so no reference atom was ever found and vit[i]->_a
+// was left nullptr; the subsequent GetIdx() call then crashed. Fixed by
+// using numeric_limits::max() as the initial sum and adding null guards.
+void caseCVE_2025_10999()
+{
+  OB_ASSERT(RunReproConvert("CVE-2025-10999", "xyz", "cacint",
+                            "cve-2025-10999.xyz"));
+}
+
+// CVE-2025-11000: out-of-bounds read in PQSFormat::ReadMolecule via lowerit().
+// When a '=' appeared at position i<4, the original code did
+// strncpy(tmp, &s[i-4], 5) reading 5 bytes before the start of the buffer.
+// Fixed by replacing strncpy+strcmp with an i<4 guard + strncmp in-place.
+void caseCVE_2025_11000()
+{
+  OB_ASSERT(RunRepro("CVE-2025-11000", "pqs", "cve-2025-11000.pqs"));
+}
+
+// CVE-2022-37331: stack-buffer-overflow in GaussianOutputFormat::ReadMolecule
+// during the orientation pre-scan. strncpy(coords_type, vs[0], 24) followed
+// by strcat(coords_type, " orientation:") overflowed the 25-byte coords_type[]
+// buffer when the first token on an "orientation:" line exceeded 10 chars.
+// Fixed by replacing coords_type with std::string.
+void caseCVE_2022_37331()
+{
+  OB_ASSERT(RunRepro("CVE-2022-37331", "g09", "cve-2022-37331.g09"));
+}
+
+// CVE-2022-41793: heap-buffer-overflow in CSRFormat::PadString when
+// mol.GetTitle() is longer than the 100-byte output buffer. strncpy was
+// called with strlen(input) as the limit instead of the buffer size,
+// so a title longer than 100 chars overflowed into adjacent heap memory
+// during WriteCSRHeader.
+void caseCVE_2022_41793()
+{
+  OB_ASSERT(RunReproConvert("CVE-2022-41793", "xyz", "csr",
+                            "cve-2022-41793.xyz"));
+}
+
+// CVE-2025-10994: heap-use-after-free in GAMESSOutputFormat::ReadMolecule
+// when a line matching "ICHARG=" or "MULT " has fewer whitespace-separated
+// tokens than expected, causing vs[1] or vs[2] to read freed vector memory.
+void caseCVE_2025_10994()
+{
+  OB_ASSERT(RunRepro("CVE-2025-10994", "gamout", "cve-2025-10994.out"));
+}
+
+// CVE-2022-43607: stack-buffer-overflow in MOL2Format::ReadMolecule when
+// parsing a UCSF Dock "##########" comment line with an attribute or value
+// field longer than 31 chars.  sscanf %[^:] and %s had no width limit,
+// overflowing the 32-byte attr[] and val[] stack buffers.
+// Requires the -c INOPTION (UCSF Dock comment mode) to reach the sscanf.
+void caseCVE_2022_43607()
+{
+  OB_ASSERT(RunReproWithInputFlag("CVE-2022-43607", "mol2",
+                                  "cve-2022-43607.mol2", "c"));
+}
+
+// NULL dereference in OBAtom::IsPeriodic() when PointGroupPrivate::establish_pairs
+// calls GetDistance() on a temporary OBAtom with no parent molecule.
+// Fixed by null-checking GetParent() in OBAtom::IsPeriodic().
+void casePointGroupNullParent()
+{
+  OB_ASSERT(RunReproConvert("pointgroup-null-parent", "g09", "xyz",
+                            "methane-pointgroup.g09"));
+}
+
+// Write a high-atomic-number SMILES through every registered writable
+// format. The original report was a global-buffer-overflow in
+// OBMol::ConvertZeroBonds(), where the 113-entry BLOCKS[] table was
+// indexed by GetAtomicNum() — an unsigned char that can hold any value
+// up to 255. Similar off-table assumptions can lurk in other writers,
+// so we don't care whether each writer succeeds; we only require that
+// none crashes or trips a sanitizer on out-of-table elements.
+static void writeHighZToAllFormats(const string &smiles)
+{
+  OBConversion readConv;
+  OB_ASSERT(readConv.SetInFormat("smi"));
+
+  OBMol mol;
+  OB_ASSERT(readConv.ReadString(&mol, smiles));
+
+  vector<string> formats;
+  OBPlugin::ListAsVector("formats", "ids", formats);
+  OB_ASSERT(!formats.empty());
+
+  for (const string &id : formats) {
+    OBConversion conv;
+    if (!conv.SetOutFormat(id.c_str()))
+      continue; // not writable (NOTWRITABLE flag), or unknown
+    // We only care that this doesn't crash. Result string, return value,
+    // and per-format warnings are all irrelevant.
+    (void)conv.WriteString(&mol);
+  }
+}
+
+void caseHighZSmilesToAllFormats()
+{
+  // Two disconnected atoms (so we exercise both single-atom and multi-
+  // atom code paths) plus a third high-Z atom bonded to a normal one
+  // (so writers that walk bonds also see an off-table neighbour).
+  writeHighZToAllFormats("[#129].[#250].C[#200]");
+}
+
+// Truncated-record hardening (no CVE id): each of the following formats used
+// to read atom/bond fields with sscanf (or fixed-column offsets) without
+// checking how many fields were actually parsed. A record with too few fields
+// left stack locals holding stale values -- from the previous record or from
+// uninitialized memory -- which were then copied into the OBMol and could be
+// written back out by any normal writer (an information-exposure bug). The
+// fix counts required conversions / bounds-checks offsets and rejects the
+// record. Each corpus file has one valid record followed by a truncated one.
+
+// MacroModel: atom line missing its x/y/z coordinates (only the type and one
+// connection pair are present).
+void caseTruncatedMmod()
+{
+  OB_ASSERT(RunReproExpectReject("truncated-mmod", "mmod",
+                                 "truncated-record.mmod"));
+}
+
+// Chem3D Cartesian: atom line with only the element symbol, missing the
+// atom number and x/y/z coordinates.
+void caseTruncatedChem3d()
+{
+  OB_ASSERT(RunReproExpectReject("truncated-chem3d", "c3d1",
+                                 "truncated-record.c3d"));
+}
+
+// CCC (fixed column): atom line shorter than the fixed coordinate column, so
+// the coordinate sscanf would otherwise read past the end of the line.
+void caseTruncatedCcc()
+{
+  OB_ASSERT(RunReproExpectReject("truncated-ccc", "ccc",
+                                 "truncated-record.ccc"));
+}
+
+// Ghemical: bond line with only the first atom index, missing the second
+// index (and the optional bond-order code).
+void caseTruncatedGhemical()
+{
+  OB_ASSERT(RunReproExpectReject("truncated-ghemical", "gpr",
+                                 "truncated-record.gpr"));
+}
+
+// Mol2: ATOM record missing the z coordinate and SYBYL atom type.
+void caseTruncatedMol2()
+{
+  OB_ASSERT(RunReproExpectReject("truncated-mol2", "mol2",
+                                 "truncated-record.mol2"));
+}
+
+// GAMESS undersized conformer (no CVE id): heap-buffer-overflow in
+// OBAtom::SetVector via ConnectTheDots()->BeginModify(). An empty/malformed
+// leading "ATOMIC ... COORDINATES (BOHR)" block created a zero-length
+// conformer while natoms was still 0; a later "COORDINATES OF ALL ATOMS"
+// block then created the real atoms. The "drop last geometry as duplicate"
+// pop_back() discarded the correctly-sized conformer, leaving the undersized
+// one active, so reading coordinates ran off the end of the array.  Fixed by
+// only recording a conformer when a full natoms*3 set of coordinates was
+// parsed. The reproducer must read cleanly (and bond the C=O, proving the
+// real, correctly-sized coordinates survived).
+void caseGamessEmptyFirstGeom()
+{
+  OB_ASSERT(RunRepro("gamess-empty-first-geom", "gamout",
+                     "gamess-empty-first-geom.gamout"));
+}
+
+// Gaussian truncated orientation block (no CVE id): same conformer-sizing class
+// as the GAMESS bug above. A later "Standard orientation:" block with fewer
+// atom rows than the first left the coordinates vector shorter than natoms*3,
+// so the memcpy that builds the conformer read past its end. Fixed by only
+// recording a conformer when coordinates.size() == natoms*3.
+void caseGaussTruncatedOrientation()
+{
+  OB_ASSERT(RunRepro("gauss-truncated-orientation", "g09",
+                     "gauss-truncated-orientation.g09"));
+}
+
+// Molden mismatched geometry frame (no CVE id): a [GEOMETRIES] (XYZ) frame
+// that declares more atoms than the first frame produced a coordinates list
+// longer than the molecule, and the conformer fill loop wrote past the
+// per-atom confCoord buffer (heap-buffer-overflow write). Fixed by clamping
+// the write to NumAtoms() and zero-filling any shortfall.
+void caseMoldenMismatchedFrame()
+{
+  OB_ASSERT(RunRepro("molden-mismatched-frame", "molden",
+                     "molden-mismatched-frame.molden"));
+}
+
+// abinit underfilled xcart (no CVE id): the file declared natom atoms but the
+// xcart block supplied fewer positions, so numConformers rounded to 0.
+// DeleteConformer(0) then freed the only (EndModify) conformer, leaving the
+// molecule's active coordinate pointer dangling for the following
+// ConnectTheDots() (heap-use-after-free). Fixed by only deleting the
+// placeholder conformer when real frames were added.
+void caseAbinitUnderfilledXcart()
+{
+  OB_ASSERT(RunRepro("abinit-underfilled-xcart", "abinit",
+                     "abinit-underfilled-xcart.abinit"));
+}
+
+// Canonical labeling recursion depth (no CVE id): stack-overflow in
+// CanonicalLabelsImpl::CanonicalLabelsRecursive on a pathological input (here a
+// long unbranched chain). The recursion descends roughly once per atom, so a
+// big enough molecule exhausts the call stack before the time-based Timeout can
+// fire. Fixed by capping the recursion depth and bailing out gracefully (like a
+// timeout). Read a long-chain SMILES and write canonical SMILES to drive the
+// labeler, as the fuzzer's "can" output target does.
+void caseCanonDeepRecursion()
+{
+  OB_ASSERT(RunReproConvert("canon-deep-recursion", "smi", "can",
+                            "canon-deep-recursion.smi"));
+}
+
+// WLN ring-size underflow (no CVE id): NULL/wild pointer dereference in
+// WLNParser::new_cycle. A crafted poly/peri ring descriptor drives the
+// unsigned ring-size arithmetic in parse_ring to wrap `size` to 0 (or ~4e9),
+// after which new_cycle's `for (i=0; i<size-1; ...)` loop indexes an empty
+// ring vector and NMOBMolNewBond dereferences the resulting NULL OBAtom*.
+// Fixed by bounding `size` to a real ring range before constructing it.
+// Reader must now return cleanly without a crash or hang.
+void caseWLNRingSizeUnderflow()
+{
+  OB_ASSERT(RunRepro("wln-ring-size-underflow", "wln",
+                     "wln-ring-size-underflow.wln"));
+}
+
+// InChI MAXVAL overflow (no CVE id): heap buffer overflow in
+// InChIFormat::WriteMolecule. Each inchi_Atom has fixed neighbor/bond_type/
+// bond_stereo arrays of MAXVAL (20) entries; the bond-copy loop wrote
+// iat.neighbor[nbonds] etc. with no nbonds < MAXVAL bound, so an atom of
+// degree > 20 (here a star with a central atom bonded to 25 others) stored
+// past the end of the arrays and corrupted the adjacent heap-allocated
+// inchi_Atom. Fixed by bounding the loop at MAXVAL. Read the SDF reproducer
+// and exercise the InChI writer; it must not crash or trip a sanitizer.
+void caseInChIMaxvalOverflow()
+{
+  OB_ASSERT(RunReproConvert("inchi-maxval-overflow", "sdf", "inchi",
+                            "inchi-maxval-overflow.sdf"));
+}
+
+// graphsym integer overflow (no CVE id): the symmetry-class refinement in
+// OBGraphSymPrivate::CreateNewClassVector packs a base-100 sum of an atom's
+// neighbour classes (id + n0*100 + n1*100^2 + ...). Any atom of degree >= 4
+// (a quaternary carbon, sulfate, ferrocene's degree-10 iron, ...) overflows
+// the accumulator; the historical code did this in a signed int (undefined
+// behaviour) and, in the sibling overload, an unsigned int. Fixed by doing
+// the arithmetic in 64-bit intermediates truncated back to 32-bit -- bit-for-
+// bit identical output, no overflow. Canonicalise (smi -> can) a set of high
+// degree / high symmetry molecules so a sanitizer build aborts here if the
+// overflow is reintroduced. NB: catching the *unsigned* variant requires the
+// build to enable -fsanitize=unsigned-integer-overflow (see CONTRIBUTING/CI).
+void caseGraphSymHighDegree()
+{
+  OB_ASSERT(RunReproConvert("graphsym-highdegree", "smi", "can",
+                            "graphsym-highdegree.smi"));
+}
+
+// graphsym non-convergent refinement (no CVE id): stack exhaustion in
+// OBGraphSymPrivate::ExtendInvariants. The refinement is meant to split
+// symmetry classes until the class count settles, but CreateNewClassVector
+// packs the classes as base-100 digits, which collides once a fragment has
+// more than 99 classes -- and a collision *merges* two classes instead of
+// splitting them. The count can then oscillate forever rather than settle
+// (this 282-atom polysarcosine peptoid alternates between 268 and 266
+// classes), and the old code recursed into ExtendInvariants() on every
+// unsettled round until the call stack ran out. Fixed by bounding the
+// refinement to one round per atom instead of recursing. Reading the 2D
+// MDL file is enough to drive it, via stereo perception from 2D.
+void caseGraphSymNonConvergent()
+{
+  OB_ASSERT(RunRepro("graphsym-nonconvergent", "mol",
+                     "graphsym-nonconvergent.mol"));
+}
+
+// mcdl truncated cycle fragment (no CVE id): heap-buffer-overflow in
+// TSimpleMolecule::redraw. defC() builds the layout priority list in groups,
+// one group per ring fragment, and records the group's size in dsSC for every
+// entry of that group. It stops writing at atomClean entries, so a fragment
+// that does not fit is truncated -- but its dsSC still names the full,
+// untruncated size. redraw()'s dsTP==3/4 branch then walked dsATN[i..i+dsSC-1]
+// and read past the end of the vector. The sibling dsTP==2 branch already
+// clamped this (issue #1851); the 3/4 branch did not. The same input also hit
+// a NaN: for a ring whose two anchor atoms are diametrically opposite, the
+// circumradius equals the half chord, so rounding drove sqrt(cf*cf-r*r)
+// negative and the resulting NaN spread through the coordinates. Writing SVG
+// runs gen2D, which is what drives redraw().
+void caseMcdlTruncatedCycle()
+{
+  OB_ASSERT(RunReproConvert("mcdl-truncated-cycle", "smi", "svg",
+                            "mcdl-truncated-cycle.smi"));
+}
+
+// BGF out-of-bounds CONECT/ORDER index (no CVE id): heap-buffer-overflow write
+// in BGFFormat::ReadMolecule. vcon/vord are sized to exactly NumAtoms entries,
+// but the CONECT handler converted the file's 1-based atom index to 0-based
+// (bgn = atoi(..) - 1) and then bounds-checked it with "bgn > mol.NumAtoms()".
+// An index of NumAtoms+1 yields bgn == NumAtoms, which that test accepts, so
+// vcon[bgn].push_back() ran a phantom std::vector control block read out of
+// adjacent heap memory and wrote through it. The ORDER branch repeated the
+// same guard and additionally did an arbitrary write, vord[bgn][i-2] = atoi().
+// Fixed by testing "bgn >= mol.NumAtoms()" at both sites; bgn is unsigned, so
+// zero/negative file indices wrap and are caught by the same bound.
+void caseBgfConectOob()
+{
+  OB_ASSERT(RunRepro("bgf-conect-oob", "bgf", "bgf-conect-oob.bgf"));
+}
+
+// BGF first-atom CONECT record (no CVE id): the same guard's lower half,
+// "bgn < 1", rejected bgn == 0 -- which is the *first* atom, not an invalid
+// index -- so every CONECT/ORDER record belonging to atom 1 was silently
+// discarded. BGF normally lists connectivity symmetrically, so the partner's
+// record usually re-added the bond and masked the loss; it only shows up when
+// a bond is listed solely on atom 1, as here. This is an accept-side pin for
+// the memory-safety fix above: the file must read as 2 atoms and 1 bond.
+// Before the fix it read as 2 atoms and 0 bonds.
+void caseBgfAtom1Conect()
+{
+  OB_ASSERT(RunReproExpectMolecule("bgf-atom1-conect", "bgf",
+                                   "bgf-atom1-conect.bgf", 2, 1));
+}
+
+int fuzzregresstest(int argc, char *argv[])
+{
+  int defaultchoice = 1;
+  int choice = defaultchoice;
+
+  if (argc > 1) {
+    if (sscanf(argv[1], "%d", &choice) != 1) {
+      printf("Couldn't parse that input as a number\n");
+      return -1;
+    }
+  }
+
+#ifdef FORMATDIR
+  char env[BUFF_SIZE];
+  snprintf(env, BUFF_SIZE, "BABEL_LIBDIR=%s", FORMATDIR);
+  putenv(env);
+#endif
+
+  switch (choice) {
+  case 1:
+    caseCVE_2026_2704();
+    break;
+  case 2:
+    caseCVE_2026_2705();
+    break;
+  case 3:
+    caseCVE_2026_3408();
+    break;
+  case 4:
+    caseANT_2026_00770();
+    break;
+  case 5:
+    caseCVE_2022_46291();
+    break;
+  case 6:
+    caseCVE_2022_46292();
+    break;
+  case 7:
+    caseCVE_2022_46293();
+    break;
+  case 8:
+    caseCVE_2022_46294();
+    break;
+  case 9:
+    caseCVE_2022_46295();
+    break;
+  case 10:
+    caseCVE_2022_46289();
+    break;
+  case 11:
+    caseCVE_2022_46290();
+    break;
+  case 12:
+    caseCVE_2022_42885();
+    break;
+  case 13:
+    caseCVE_2022_44451();
+    break;
+  case 14:
+    caseCVE_2022_46280();
+    break;
+  case 15:
+    caseCVE_2022_43467();
+    break;
+  case 16:
+    caseCVE_2022_43607();
+    break;
+  case 17:
+    caseCVE_2025_10994();
+    break;
+  case 18:
+    caseCVE_2022_41793();
+    break;
+  case 19:
+    caseCVE_2022_37331();
+    break;
+  case 20:
+    caseCVE_2025_11000();
+    break;
+  case 21:
+    caseCVE_2025_10999();
+    break;
+  case 22:
+    caseCVE_2025_10996();
+    break;
+  case 23:
+    caseCVE_2025_10995();
+    break;
+  case 24:
+    caseCVE_2025_10997();
+    break;
+  case 25:
+    caseCVE_2025_10998();
+    break;
+  case 26:
+    casePointGroupNullParent();
+    break;
+  case 27:
+    caseHighZSmilesToAllFormats();
+    break;
+  case 28:
+    caseTrailOfBits_2026();
+    break;
+  case 29:
+    caseTruncatedMmod();
+    break;
+  case 30:
+    caseTruncatedChem3d();
+    break;
+  case 31:
+    caseTruncatedCcc();
+    break;
+  case 32:
+    caseTruncatedGhemical();
+    break;
+  case 33:
+    caseTruncatedMol2();
+    break;
+  case 34:
+    caseGamessEmptyFirstGeom();
+    break;
+  case 35:
+    caseGaussTruncatedOrientation();
+    break;
+  case 36:
+    caseMoldenMismatchedFrame();
+    break;
+  case 37:
+    caseAbinitUnderfilledXcart();
+    break;
+  case 38:
+    caseCanonDeepRecursion();
+    break;
+  case 39:
+    caseWLNRingSizeUnderflow();
+    break;
+  case 40:
+    caseInChIMaxvalOverflow();
+    break;
+  case 41:
+    caseGraphSymHighDegree();
+    break;
+  case 42:
+    caseGraphSymNonConvergent();
+    break;
+  case 43:
+    caseMcdlTruncatedCycle();
+    break;
+  case 48:
+    caseBgfConectOob();
+    break;
+  case 49:
+    caseBgfAtom1Conect();
+    break;
+  default:
+    cout << "Test number " << choice << " does not exist!\n";
+    return -1;
+  }
+
+  return 0;
+}

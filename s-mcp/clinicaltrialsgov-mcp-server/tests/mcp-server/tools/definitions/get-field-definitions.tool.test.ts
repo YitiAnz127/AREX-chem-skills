@@ -1,0 +1,462 @@
+/**
+ * @fileoverview Tests for clinicaltrials_get_field_definitions tool.
+ * @module tests/mcp-server/tools/definitions/get-field-definitions.tool
+ */
+
+import { McpError } from '@cyanheads/mcp-ts-core/errors';
+import { createMockContext, getEnrichment } from '@cyanheads/mcp-ts-core/testing';
+import { beforeEach, describe, expect, it, vi } from 'vitest';
+
+const { mockGetService } = vi.hoisted(() => ({
+  mockGetService: vi.fn(),
+}));
+
+vi.mock('@/services/clinical-trials/clinical-trials-service.js', () => ({
+  getClinicalTrialsService: mockGetService,
+}));
+
+import { getFieldDefinitions } from '@/mcp-server/tools/definitions/get-field-definitions.tool.js';
+import type { FieldNode } from '@/services/clinical-trials/types.js';
+
+const sampleTree: FieldNode[] = [
+  {
+    name: 'protocolSection',
+    children: [
+      {
+        name: 'identificationModule',
+        piece: 'IdentificationModule',
+        type: 'OBJECT',
+        children: [
+          {
+            name: 'nctId',
+            piece: 'NCTId',
+            sourceType: 'STRING',
+            type: 'STRING',
+            isEnum: false,
+            description: 'The NCT identifier',
+          },
+          {
+            name: 'briefTitle',
+            piece: 'BriefTitle',
+            sourceType: 'STRING',
+            type: 'STRING',
+            isEnum: false,
+          },
+        ],
+      },
+      {
+        name: 'statusModule',
+        piece: 'StatusModule',
+        type: 'OBJECT',
+        children: [
+          {
+            name: 'overallStatus',
+            piece: 'OverallStatus',
+            sourceType: 'STRING',
+            type: 'STRING',
+            isEnum: true,
+          },
+        ],
+      },
+    ],
+  },
+  {
+    name: 'resultsSection',
+    children: [
+      {
+        name: 'outcomeMeasuresModule',
+        piece: 'OutcomeMeasuresModule',
+        type: 'OBJECT',
+      },
+    ],
+  },
+];
+
+describe('getFieldDefinitions', () => {
+  const mockService = { getMetadata: vi.fn(), searchFieldDefinitions: vi.fn() };
+
+  beforeEach(() => {
+    vi.clearAllMocks();
+    mockGetService.mockReturnValue(mockService as never);
+  });
+
+  describe('input validation', () => {
+    it('requires mode parameter', () => {
+      expect(() => getFieldDefinitions.input!.parse({})).toThrow();
+    });
+
+    it('accepts overview mode', () => {
+      const input = getFieldDefinitions.input!.parse({ mode: 'overview' });
+      expect(input.mode).toBe('overview');
+    });
+
+    it('accepts drill mode with path', () => {
+      const input = getFieldDefinitions.input!.parse({
+        mode: 'drill',
+        path: 'protocolSection.statusModule',
+      });
+      expect(input.path).toBe('protocolSection.statusModule');
+    });
+
+    it('accepts search mode with query', () => {
+      const input = getFieldDefinitions.input!.parse({ mode: 'search', query: 'enrollment' });
+      expect(input.query).toBe('enrollment');
+    });
+
+    it('accepts includeIndexedOnly flag with drill mode', () => {
+      const input = getFieldDefinitions.input!.parse({
+        mode: 'drill',
+        path: 'protocolSection',
+        includeIndexedOnly: true,
+      });
+      expect(input.includeIndexedOnly).toBe(true);
+    });
+
+    it('defaults limit to 20 in search mode', () => {
+      const input = getFieldDefinitions.input!.parse({ mode: 'search', query: 'sponsor' });
+      expect(input.limit).toBe(20);
+    });
+  });
+
+  describe('handler', () => {
+    it('returns top-level overview in overview mode', async () => {
+      mockService.getMetadata.mockResolvedValue(sampleTree);
+      const ctx = createMockContext({ errors: getFieldDefinitions.errors });
+      const input = getFieldDefinitions.input!.parse({ mode: 'overview' });
+      const result = await getFieldDefinitions.handler(input, ctx);
+
+      expect(result.fields).toHaveLength(2);
+      expect(result.fields[0]!.name).toBe('protocolSection');
+      expect(result.fields[0]!.children).toBeDefined();
+      expect(result.fields[0]!.children).toHaveLength(2);
+      expect(result.resolvedPath).toBeUndefined();
+    });
+
+    it('includes child summaries in overview', async () => {
+      mockService.getMetadata.mockResolvedValue(sampleTree);
+      const ctx = createMockContext({ errors: getFieldDefinitions.errors });
+      const result = await getFieldDefinitions.handler(
+        getFieldDefinitions.input!.parse({ mode: 'overview' }),
+        ctx,
+      );
+
+      const protocolChildren = result.fields[0]!.children!;
+      expect(protocolChildren[0]!).toMatchObject({
+        name: 'identificationModule',
+        piece: 'IdentificationModule',
+        hasChildren: true,
+      });
+    });
+
+    it('returns totalFields count for overview', async () => {
+      mockService.getMetadata.mockResolvedValue(sampleTree);
+      const ctx = createMockContext({ errors: getFieldDefinitions.errors });
+      const result = await getFieldDefinitions.handler(
+        getFieldDefinitions.input!.parse({ mode: 'overview' }),
+        ctx,
+      );
+
+      // 2 top-level sections + 2 children of protocolSection + 1 child of resultsSection = 5
+      expect(result.totalFields).toBe(5);
+    });
+
+    it('navigates to a path in drill mode', async () => {
+      mockService.getMetadata.mockResolvedValue(sampleTree);
+      const ctx = createMockContext({ errors: getFieldDefinitions.errors });
+      const input = getFieldDefinitions.input!.parse({
+        mode: 'drill',
+        path: 'protocolSection.identificationModule',
+      });
+      const result = await getFieldDefinitions.handler(input, ctx);
+
+      expect(result.resolvedPath).toBe('protocolSection.identificationModule');
+      expect(result.fields).toHaveLength(2);
+      expect(result.fields[0]!.name).toBe('nctId');
+      expect(result.fields[0]!.piece).toBe('NCTId');
+      expect(result.fields[0]!.path).toBe('protocolSection.identificationModule.nctId');
+      expect(result.fields[1]!.name).toBe('briefTitle');
+    });
+
+    it('throws on invalid path in drill mode', async () => {
+      mockService.getMetadata.mockResolvedValue(sampleTree);
+      const ctx = createMockContext({ errors: getFieldDefinitions.errors });
+      const input = getFieldDefinitions.input!.parse({
+        mode: 'drill',
+        path: 'nonexistent.path',
+      });
+
+      await expect(getFieldDefinitions.handler(input, ctx)).rejects.toThrow(
+        /Path 'nonexistent.path' not found/,
+      );
+    });
+
+    it('includes available section names in error for invalid path', async () => {
+      mockService.getMetadata.mockResolvedValue(sampleTree);
+      const ctx = createMockContext({ errors: getFieldDefinitions.errors });
+      const input = getFieldDefinitions.input!.parse({ mode: 'drill', path: 'badSection' });
+
+      await expect(getFieldDefinitions.handler(input, ctx)).rejects.toThrow(
+        /protocolSection.*resultsSection/,
+      );
+    });
+
+    it('surfaces the current mode-based recovery hint on invalid drill path (#87)', async () => {
+      mockService.getMetadata.mockResolvedValue(sampleTree);
+      const ctx = createMockContext({ errors: getFieldDefinitions.errors });
+      const input = getFieldDefinitions.input!.parse({ mode: 'drill', path: 'bad.path' });
+
+      try {
+        await getFieldDefinitions.handler(input, ctx);
+        expect.fail('should have thrown');
+      } catch (err) {
+        expect(err).toBeInstanceOf(McpError);
+        const data = (err as McpError).data as Record<string, unknown>;
+        expect(data?.reason).toBe('path_not_found');
+        const hint = (data?.recovery as { hint?: string } | undefined)?.hint ?? '';
+        // No-args overview was removed in #48/#49 — the hint must name the mode-based
+        // shape, not the now-invalid "omit both arguments" call.
+        expect(hint).toContain('mode="overview"');
+        expect(hint).not.toContain('omit both arguments');
+      }
+    });
+
+    it('navigates single-level path', async () => {
+      mockService.getMetadata.mockResolvedValue(sampleTree);
+      const ctx = createMockContext({ errors: getFieldDefinitions.errors });
+      const input = getFieldDefinitions.input!.parse({ mode: 'drill', path: 'protocolSection' });
+      const result = await getFieldDefinitions.handler(input, ctx);
+
+      expect(result.resolvedPath).toBe('protocolSection');
+      expect(result.fields.some((f) => f.name === 'nctId')).toBe(true);
+    });
+
+    it('recursively flattens nested children', async () => {
+      mockService.getMetadata.mockResolvedValue(sampleTree);
+      const ctx = createMockContext({ errors: getFieldDefinitions.errors });
+      const input = getFieldDefinitions.input!.parse({ mode: 'drill', path: 'protocolSection' });
+      const result = await getFieldDefinitions.handler(input, ctx);
+
+      // identificationModule + its 2 children + statusModule + its 1 child = 5
+      expect(result.totalFields).toBe(5);
+    });
+
+    it('passes includeIndexedOnly to service in drill mode', async () => {
+      mockService.getMetadata.mockResolvedValue(sampleTree);
+      const ctx = createMockContext({ errors: getFieldDefinitions.errors });
+      await getFieldDefinitions.handler(
+        getFieldDefinitions.input!.parse({
+          mode: 'drill',
+          path: 'protocolSection',
+          includeIndexedOnly: true,
+        }),
+        ctx,
+      );
+
+      expect(mockService.getMetadata).toHaveBeenCalledWith(true, ctx);
+    });
+
+    it('defaults includeIndexedOnly to false in drill mode', async () => {
+      mockService.getMetadata.mockResolvedValue(sampleTree);
+      const ctx = createMockContext({ errors: getFieldDefinitions.errors });
+      await getFieldDefinitions.handler(
+        getFieldDefinitions.input!.parse({ mode: 'drill', path: 'protocolSection' }),
+        ctx,
+      );
+
+      expect(mockService.getMetadata).toHaveBeenCalledWith(false, ctx);
+    });
+
+    it('routes to searchFieldDefinitions in search mode', async () => {
+      mockService.searchFieldDefinitions.mockResolvedValue({
+        entries: [
+          {
+            name: 'enrollmentInfo',
+            piece: 'EnrollmentCount',
+            path: 'protocolSection.designModule.enrollmentInfo.count',
+            type: 'INTEGER',
+          },
+        ],
+        total: 1,
+      });
+      const ctx = createMockContext({ errors: getFieldDefinitions.errors });
+      const input = getFieldDefinitions.input!.parse({
+        mode: 'search',
+        query: 'enrollment',
+        limit: 5,
+      });
+      const result = await getFieldDefinitions.handler(input, ctx);
+
+      expect(mockService.searchFieldDefinitions).toHaveBeenCalledWith('enrollment', 5, ctx);
+      expect(mockService.getMetadata).not.toHaveBeenCalled();
+      const enrichment = getEnrichment(ctx);
+      expect(enrichment.searchQuery).toBe('enrollment');
+      expect(enrichment.totalMatches).toBe(1);
+      expect(result.fields).toHaveLength(1);
+      expect(result.fields[0]!.piece).toBe('EnrollmentCount');
+    });
+
+    it('surfaces the pre-cap totalMatches on an uncapped search (#95)', async () => {
+      mockService.searchFieldDefinitions.mockResolvedValue({
+        entries: [
+          { name: 'a', piece: 'A', path: 'x.a', type: 'STRING' },
+          { name: 'b', piece: 'B', path: 'x.b', type: 'STRING' },
+        ],
+        total: 2,
+      });
+      const ctx = createMockContext({ errors: getFieldDefinitions.errors });
+      const input = getFieldDefinitions.input!.parse({ mode: 'search', query: 'ab', limit: 20 });
+      const result = await getFieldDefinitions.handler(input, ctx);
+
+      const enrichment = getEnrichment(ctx);
+      expect(enrichment.totalMatches).toBe(2);
+      expect(enrichment.truncated).toBeUndefined();
+      // totalFields is the returned count; totalMatches is the pre-cap match count.
+      expect(result.totalFields).toBe(2);
+    });
+
+    it('surfaces the pre-cap totalMatches on a capped search, distinguishing depth (#95)', async () => {
+      const entries = Array.from({ length: 3 }, (_, i) => ({
+        name: `f${i}`,
+        piece: `F${i}`,
+        path: `x.f${i}`,
+        type: 'STRING',
+      }));
+      mockService.searchFieldDefinitions.mockResolvedValue({ entries, total: 137 });
+      const ctx = createMockContext({ errors: getFieldDefinitions.errors });
+      const input = getFieldDefinitions.input!.parse({ mode: 'search', query: 'date', limit: 3 });
+      const result = await getFieldDefinitions.handler(input, ctx);
+
+      const enrichment = getEnrichment(ctx);
+      // Without totalMatches, a 4-match and a 137-match capped search look identical.
+      expect(enrichment.totalMatches).toBe(137);
+      expect(enrichment.truncated).toBe(true);
+      expect(enrichment.shown).toBe(3);
+      expect(enrichment.cap).toBe(3);
+      expect(result.totalFields).toBe(3);
+    });
+
+    it('omits totalMatches outside search mode (#95)', async () => {
+      mockService.getMetadata.mockResolvedValue(sampleTree);
+      for (const input of [
+        getFieldDefinitions.input!.parse({ mode: 'overview' }),
+        getFieldDefinitions.input!.parse({
+          mode: 'drill',
+          path: 'protocolSection.identificationModule',
+        }),
+      ]) {
+        const ctx = createMockContext({ errors: getFieldDefinitions.errors });
+        await getFieldDefinitions.handler(input, ctx);
+        expect(getEnrichment(ctx).totalMatches).toBeUndefined();
+      }
+    });
+
+    it('does not flag truncated when matches are at or below the cap (#77)', async () => {
+      mockService.searchFieldDefinitions.mockResolvedValue({
+        entries: [
+          { name: 'a', piece: 'A', path: 'x.a', type: 'STRING' },
+          { name: 'b', piece: 'B', path: 'x.b', type: 'STRING' },
+          { name: 'c', piece: 'C', path: 'x.c', type: 'STRING' },
+        ],
+        total: 3,
+      });
+      const ctx = createMockContext({ errors: getFieldDefinitions.errors });
+      const input = getFieldDefinitions.input!.parse({ mode: 'search', query: 'abc', limit: 20 });
+      await getFieldDefinitions.handler(input, ctx);
+
+      const enrichment = getEnrichment(ctx);
+      expect(enrichment.truncated).toBeUndefined();
+      expect(enrichment.notice).toBeUndefined();
+    });
+
+    it('flags truncated only when the match set exceeds the cap (#77)', async () => {
+      const entries = Array.from({ length: 5 }, (_, i) => ({
+        name: `f${i}`,
+        piece: `F${i}`,
+        path: `x.f${i}`,
+        type: 'STRING',
+      }));
+      mockService.searchFieldDefinitions.mockResolvedValue({ entries, total: 42 });
+      const ctx = createMockContext({ errors: getFieldDefinitions.errors });
+      const input = getFieldDefinitions.input!.parse({ mode: 'search', query: 'f', limit: 5 });
+      await getFieldDefinitions.handler(input, ctx);
+
+      const enrichment = getEnrichment(ctx);
+      expect(enrichment.truncated).toBe(true);
+      expect(enrichment.shown).toBe(5);
+      expect(enrichment.cap).toBe(5);
+    });
+
+    it('rejects search mode without query', async () => {
+      const ctx = createMockContext({ errors: getFieldDefinitions.errors });
+      const input = getFieldDefinitions.input!.parse({ mode: 'search' });
+
+      await expect(getFieldDefinitions.handler(input, ctx)).rejects.toThrow(/requires `query`/);
+    });
+
+    it('rejects drill mode without path', async () => {
+      const ctx = createMockContext({ errors: getFieldDefinitions.errors });
+      const input = getFieldDefinitions.input!.parse({ mode: 'drill' });
+
+      await expect(getFieldDefinitions.handler(input, ctx)).rejects.toThrow(/requires `path`/);
+    });
+  });
+
+  describe('format', () => {
+    it('renders overview with children and arrows', () => {
+      const blocks = getFieldDefinitions.format!({
+        fields: [
+          {
+            name: 'protocolSection',
+            children: [
+              { name: 'identificationModule', piece: 'IdentificationModule', hasChildren: true },
+              { name: 'statusModule', piece: 'StatusModule', type: 'OBJECT', isEnum: false },
+            ],
+          },
+        ],
+        totalFields: 3,
+      });
+      const text = (blocks[0] as { text: string }).text;
+      expect(text).toContain('protocolSection');
+      expect(text).toContain('identificationModule [IdentificationModule]');
+      expect(text).toContain('→'); // arrow for hasChildren
+    });
+
+    it('renders path result with field details', () => {
+      const blocks = getFieldDefinitions.format!({
+        fields: [
+          { name: 'nctId', piece: 'NCTId', sourceType: 'STRING' },
+          { name: 'overallStatus', piece: 'OverallStatus', sourceType: 'STRING', isEnum: true },
+        ],
+        totalFields: 2,
+        resolvedPath: 'protocolSection.identificationModule',
+      });
+      const text = (blocks[0] as { text: string }).text;
+      expect(text).toContain('protocolSection.identificationModule');
+      expect(text).toContain('2 fields');
+      expect(text).toContain('nctId [NCTId]');
+      expect(text).toContain('ENUM');
+    });
+
+    it('renders empty result', () => {
+      const blocks = getFieldDefinitions.format!({ fields: [], totalFields: 0 });
+      expect((blocks[0] as { text: string }).text).toContain('No fields found');
+    });
+
+    it('renders search results with field piece names', () => {
+      const blocks = getFieldDefinitions.format!({
+        fields: [
+          {
+            name: 'enrollmentInfo',
+            piece: 'EnrollmentCount',
+            path: 'protocolSection.designModule.enrollmentInfo.count',
+            type: 'INTEGER',
+          },
+        ],
+        totalFields: 1,
+      });
+      const text = (blocks[0] as { text: string }).text;
+      expect(text).toContain('EnrollmentCount');
+      expect(text).toContain('enrollmentInfo');
+    });
+  });
+});

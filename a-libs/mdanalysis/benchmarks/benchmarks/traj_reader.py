@@ -1,0 +1,87 @@
+try:
+    from MDAnalysis.coordinates.DCD import DCDReader
+    from MDAnalysisTests.datafiles import DCD
+except ImportError:
+    pass
+
+try:
+    from MDAnalysis.coordinates.XTC import XTCReader
+    from MDAnalysisTests.datafiles import XTC
+except ImportError:
+    pass
+
+try:
+    from MDAnalysis.coordinates.TRR import TRRReader
+    from MDAnalysisTests.datafiles import TRR
+except ImportError:
+    pass
+
+try:
+    from MDAnalysis.coordinates.TRJ import NCDFReader
+    from MDAnalysisTests.datafiles import NCDF
+except ImportError:
+    pass
+
+try:
+    from MDAnalysis.coordinates.TRC import TRCReader
+    from MDAnalysisTests.datafiles import TRC_TRAJ_SOLV
+except ImportError:
+    pass
+
+try:
+    from MDAnalysis.coordinates.PDB import PDBReader
+    from MDAnalysisTests.datafiles import PDB_multiframe
+except ImportError:
+    pass
+
+try:
+    from MDAnalysis.coordinates.XYZ import XYZReader
+    from MDAnalysisTests.datafiles import XYZ
+except ImportError:
+    pass
+
+traj_dict = {
+    "XTC": [XTC, XTCReader],
+    "TRR": [TRR, TRRReader],
+    "DCD": [DCD, DCDReader],
+    "NCDF": [NCDF, NCDFReader],
+    "TRC": [TRC_TRAJ_SOLV, TRCReader],
+    "PDB": [PDB_multiframe, PDBReader],
+    "XYZ": [XYZ, XYZReader],
+}
+
+
+class TrajReaderCreation(object):
+    """Benchmarks for trajectory file format reading."""
+
+    params = ["XTC", "TRR", "DCD", "NCDF", "TRC", "PDB", "XYZ"]
+    param_names = ["traj_format"]
+
+    def setup(self, traj_format):
+        self.traj_dict = traj_dict
+        self.traj_file, self.traj_reader = self.traj_dict[traj_format]
+
+    def time_reads(self, traj_format):
+        """Simple benchmark for reading traj file formats
+        from our standard test files.
+        """
+        self.traj_reader(self.traj_file)
+
+
+class TrajReaderIteration(object):
+    """Benchmarks for trajectory file format striding."""
+
+    params = ["XTC", "TRR", "DCD", "NCDF", "TRC", "PDB", "XYZ"]
+    param_names = ["traj_format"]
+
+    def setup(self, traj_format):
+        self.traj_dict = traj_dict
+        self.traj_file, self.traj_reader = self.traj_dict[traj_format]
+        self.reader_object = self.traj_reader(self.traj_file)
+
+    def time_strides(self, traj_format):
+        """Benchmark striding over full trajectory
+        test files for each format.
+        """
+        for ts in self.reader_object:
+            pass

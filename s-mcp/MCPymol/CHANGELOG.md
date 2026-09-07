@@ -1,0 +1,250 @@
+# Changelog
+
+All notable changes to MCPymol will be documented in this file.
+
+The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
+and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
+
+## [Unreleased]
+
+### Added
+
+- **`mcpymol.wiggles` tier 3: ensembles.** `load_ensemble`, `latent_traverse_view`, `deformation_view`, `composition_view`. One blind-challenge result governs all four: put on the same thyroglobulin data, 41 submissions recovered molecular motions that resembled both each other and the ground truth, but the simulated truth had three population modes, most found two, and only three of 41 found all three — the missed one being the middle. So these tools draw motion and decline to draw populations. `deformation_view` is built with confidence; `latent_traverse_view` renders no latent scatter and estimates no density at all.
+- **Two invariants, enforced by tests rather than by convention.** **I2**: no latent rendering goes out unlabelled, so `latent_traverse_view` *refuses* when `load_ensemble` could not identify the generating method — cryoDRGN's latent density can bear no relation to the truth while 3DVA's frames are linear interpolations no particle occupied, and drawing them identically asserts something for one that holds only for the other. **I3**: no output may turn a gap into an absence; a phrase list is checked against every tier-3 report, refusals included.
+- **A per-frame normalisation trap, closed.** PyMOL normalises each map independently on load, so contouring a trajectory at a fixed sigma contours every frame at *its own* sigma — and a traversal is exactly the case where density genuinely changes between frames. That is the signal, and per-frame normalisation rescales it away, leaving frames that look reassuringly alike whatever the ensemble does. The level is now held in absolute terms and converted per frame, and the spread of the resulting sigmas is reported, because that spread is the change.
+- **Method detection that refuses to guess.** Heterogeneity jobs are identified from markers their own documentation describes. A directory matching nothing loads its volumes and stays `UNKNOWN`, which is what makes I2 bite. Latent tables are read from text, STAR and plain `.npy`; a `.pkl` is found but **not** read unless `trust_pickle=True`, because unpickling runs arbitrary code from a file that may have come from a collaborator or a shared scratch volume.
+
+### Fixed
+
+- **The live suite was wiping its own map fixtures before any test ran.** `_require_a_healthy_viewport()` calls `reinitialize`, and the volumes were loaded *before* it. Because map headers live in a process-global registry, a deleted object left the registry intact: `density_view` and `local_resolution_view` proceeded to contour something that no longer existed, failed with an honest domain error, passed the wiring check, and proved nothing. Both now run against volumes that are really there, and the fixture asserts its own setup rather than trusting wrappers that turn failures into strings. `map_info` and `load_map` were unaffected — they take a path and load fresh.
+- **`count_atoms` joins `DATA_ACTIONS`.** `composition_view` consumes its return value, so a test that forgot to stub it would have seen `"OK"`, read zero atoms, and exercised the empty-selection refusal instead of the tool.
+
+- **`mcpymol.wiggles`: ten cryo-EM tools for occupancy, ensembles, maps and local resolution.** `occupancy_view`, `altloc_view`, `ensemble_spread_view`, `morph_states`, `qscore_view`, `restore_bfactors`, `map_info`, `load_map`, `density_view`, `local_resolution_view`. Each exists because a render that looked fine was hiding something, and they share one rule: say what is being shown, and refuse when the picture would be meaningful-looking and wrong. `morph_states` declines to interpolate states that do not share a topology, because a morph across independently reconstructed volumes animates a correspondence nobody established. `local_resolution_view` declines to colour one map by another that does not share its voxel grid, because sampling the resolution field at the wrong coordinates renders smooth, plausible and wrong rather than visibly broken. `load_map` records provenance and never infers it — a measured reconstruction and a network-enhanced one are the same isosurface once drawn, so defaulting to "measured" would assert that somebody observed a generated volume.
+- **Two unit traps closed, both of the kind that yields a wrong answer of the right order of magnitude.** `map_info` computes voxel size as `cella/m`, not `cella/n` — the two differ on any boxed or cropped map — and the nominal figure it reports is itself only accurate to ±5–15%, which at 1.2 Å is a systematic stretch of every distance in the model. `density_view` states its contour level in both σ and absolute units, because PyMOL contours in σ while EMDB publishes absolute levels: EMD-30913's published `0.05` is 3.16 σ, and used directly it contours noise. `local_resolution_view` hits the same trap on a second axis — its ramp breakpoints are converted to σ against the *resolution* map's header, a different scale from the contour level's.
+- **The live suite now builds its own cryo-EM fixtures.** A 16 KB synthesised MRC volume and a minimal wwPDB validation report, both written by the session fixture, so all ten tools are swept against a real PyMOL without a network round trip or a checked-in binary. Nothing was added to `EXCLUDED`.
+
+### Fixed
+
+- **A residue with no chain ID made three views overwrite every atom in the session.** `qscore_view` defaults a missing chain to `""`, and the selection was built by interpolation, so `chain {chain} and resi {resi}` became `chain  and resi 2` — where PyMOL takes `and` as the chain name and the selection stops being scoped to the object. Checked on PyMOL 3.1.0: in a session holding a 7-atom object and a 10-atom one, that selection matched 10. `qscore_view` on a validation file whose entries carry no chain attribute therefore ran `alter <every atom loaded>, b=<one residue's Q-score>`, and since `restore_bfactors` only ever restores the object it is given, every other structure's B-factors were gone with no way back. `ensemble_spread_view` built the same string.
+- **A negative residue number was read as a range.** `resi -3` means 1-3 to PyMOL, not residue minus three, so one residue's value was written across three. Negative auth numbering is routine in NMR and EM entries, where it marks expression-tag remnants. Reported against `qscore.py`; `ensembles.py` had it identically and is fixed with it. **Quoting did not fix this** — see below; the escape that does is a backslash.
+- **The negative-residue fix above was incomplete, and the correction is in this same unreleased section.** `resi "-3"` is still read as the range: quoting an identifier does not escape PyMOL's range operator. Checked against PyMOL 3.1.0 on an object holding residues -3, 1 and 2, where the quoted form matched all six atoms instead of residue -3's two. The escape the grammar honours is a **backslash**, and it composes with the quoting (`resi "\-3"`) and with `+` lists. `quote` now emits both, and `tests/wiggles/test_selection_live.py` asserts atom counts from a live session rather than the spelling of the string — which is how the original fix passed a test while the bug was still there.
+- Neither shape can be reintroduced at a call site: `residue_selection` and `residue_clause` in `mcpymol.wiggles.atoms` are the only places that name a residue, and both go through `quote`, which quotes (for the blank chain) and escapes a leading minus (for the range). A quote *inside* an identifier is refused rather than guessed at, since nothing in the PDB or mmCIF grammar puts one there.
+- **Re-stashing B-factors destroyed the originals it existed to protect.** `stash_bfactors` replaced its entry unconditionally, but every caller reads `b` *after* an earlier view may already have overwritten it — so occupancy_view followed by qscore_view saved the occupancies as though they were the user's data, and `restore_bfactors` then wrote those back and reported success. The first stash now wins, and a restore clears it so the next view can take a fresh baseline. `has_stash` existed for exactly this and had no caller.
+- **`density_view` contoured in the wrong units when PyMOL was not normalising.** It converted levels to σ on the assumption that `normalize_ccp4_maps` is on, without ever checking — while `local_resolution_view`, which defines the function that checks, consulted it for its colour ramp but not for the contour it computes twenty lines later. With normalisation off a level is read as a raw density, so EMD-30913's published `0.05` went in as `3.16` and drew an empty mesh under a report stating the depositor's own contour had been applied. The level sent now follows the setting, the report says which units reached `isomesh`, and a map whose header cannot supply the conversion is refused rather than contoured on the unconverted number.
+
+- **A negative RMS inverted every conversion it touched.** The guard was `if not header.rms`, which rejects only exactly zero — but MRC2014 writes `rms = -1` (with `dmean = -2`) to mean *statistics not computed*, which is what `mrcfile` leaves behind whenever a map is saved without `update_header_stats()`, and plenty of pipelines never rewrite them. A negative RMS divides cleanly, so it sign-flipped every sigma conversion: `to_sigma(0.05)` returned −2.05, reported as a contour beside a "map sigma: −1", and in `local_resolution_view` it turned ascending Ångström breakpoints into a descending ramp — binding blue to the *worst*-resolved density under a legend stating blue was the best, the exact inversion the module refuses when a user supplies it. `usable_rms` now gates both conversions.
+- **`ensemble_spread_view` measured rigid-body drift as flexibility.** Spread was the RMS of each atom about its own position across states, with no superposition step anywhere in the module — and PyMOL loads a multi-model PDB's models as states without aligning them. An MD trajectory that drifted across its box, or two independently refined ensemble members 2 Å apart, reported that offset at *every* residue and painted an internally rigid molecule red end to end. States are now fitted onto the first before any coordinate is read; `superpose=False` opts out, and the report says which happened, because `intra_fit` moves coordinates in the session.
+- **The map and provenance registries were never invalidated.** Both are keyed by PyMOL object name and nothing evicts from them, so deleting a map left its header behind: the next contour was converted with the statistics of a volume no longer loaded, under a provenance banner asserting a measurement for whatever now held the name. `loaded_map` now takes the port and drops records whose object has gone. A map deleted and *replaced* under the same name still passes — PyMOL does not expose an object's source file — so `density_view` prints the path its header came from, which is the one thing that makes a substitution visible.
+- **`unsharpened` was read as sharpened.** Provenance tokens were scanned in declaration order and `sharp` occurs inside `unsharp`, so a file whose name recorded that it had *not* been sharpened was suggested as sharpened — inverting the one thing its depositor had troubled to write down. A token contained in another match is now discarded, so the longer reading wins whatever order the table is written in.
+- **Longest-token-wins alone lost the category priority, and that is now restored.** The declaration-order scan it replaced was carrying one: `Provenance` is ordered from observed to invented, and the warnings are not interchangeable. `postprocess` (11 characters) is longer than `emready` (7), so `postprocess_emready.mrc` — the ordinary name for running EMReady on a RELION postprocess map — was suggested as SHARPENED, offering "features are easier to over-read" in place of "treat this map as a hypothesis, not a measurement". The same happened in reverse wherever the network token was longer: `kmeans20_emready.mrc` and `3dflex_deepemhancer.mrc` lost GENERATED, which is the stronger claim still — no particle was reconstructed into that density at all. Six filenames change classification; every case the old rule got right is unchanged. Priority is read from the `Provenance` enum rather than from the token table, which lists NN_ENHANCED before GENERATED and would invert that pair.
+- **`spheroid`'s default was the value its own docstring says fails.** `cmd.spheroid` resolves its argument as an object name and answers "Object not found" for `"all"`, while its own default is the empty string meaning *every object*. Calling the tool the way its schema says you may — with no arguments — therefore always failed.
+- **`frame()` could not do the thing its schema advertised.** The parameter description says to omit it to query the current frame, but `cmd.frame` takes a required argument, so the no-argument call came back "missing 1 required positional argument". The query half now goes to `cmd.get_frame`. Found by the new defaults test below, not by review.
+- **`atom_properties` split commas inside expressions.** `properties` is an expression list evaluated by `iterate`, so a comma inside brackets or quotes belongs to the expression; splitting on every comma tore `resi in ('1','2')` into fragments handed to PyMOL as field names.
+
+### Changed
+
+- **The live suite now catches two classes it was blind to.** `WIRING_FAILURES` listed only Python binding errors, so "PyMOL accepted the signature and rejected what the argument meant" — `Object not found`, `Selector-Error`, `Invalid selection` — passed silently; those signatures are now included. Separately, the sweep supplies most arguments from its own table and so never calls a tool the way its schema says it can be called, which is why `spheroid` passed every run despite an unusable default. `test_defaults_are_usable` calls every fully-defaulted tool with no arguments; it found the `frame` defect above on its first run.
+- **`tests/test_docs.py` walks the package recursively.** The glob stopped at the top level, so tools defined in a subpackage would have escaped the checks that every tool is named in the README and in the agent skill — the exact rot this file exists to prevent, and it would have let ten of them through silently.
+- **`tests/test_package_layout.py` covers subpackages.** `mcpymol.wiggles` and `mcpymol.wiggles.tools` are both listed: the first is what the module walk sees, the second is where the tools are defined and so the one the re-export checks have to look at.
+
+## [1.5.1] - 2026-08-09
+
+Everything v1.5.0 got wrong about installing and upgrading itself, plus two
+rendering bugs found in the same review. Most of this release is documentation,
+which is the part of a newly-published package people actually run.
+
+Note that the PyPI project page for 1.5.0 renders its figures broken and always
+will — a published version is immutable. This release is what fixes that page.
+
+### Added
+
+- **README: a Requirements section.** The README never said that PyMOL itself is a prerequisite — the one thing MCPymol cannot install for you — nor which Python version the bridge needs, nor that the two halves must share a machine because several tools hand files between them through the filesystem. Optional per-feature dependencies (APBS, the `print` extra, network access) are now listed in one table instead of being mentioned wherever the feature happens to be described.
+- **README: an Upgrading section.** A failure mode that only exists now that the two halves install separately: both the plugin and the bridge keep running the code they loaded at startup, so upgrading the package on disk changes neither until PyMOL is restarted and the MCP server reconnected. It presents as a tool that is broken or a fix that did not take, rather than as a stale process. Troubleshooting gains rows for that and its neighbours.
+- **Release: the tagged commit is now tested before it is published.** `ci.yml` runs on push-to-main and pull_request, neither of which a tag push matches, so nothing between `git tag` and an immutable PyPI upload had ever run the test suite against that exact ref — `twine check` validates metadata, not whether the code works. `release.yml` now runs the full matrix, lint and mypy against the tagged commit, and the build job depends on them.
+- **README: the two opt-in test suites.** `pytest -m live` and `pytest -m network` were undocumented despite being the safety net for everything the mocked suite structurally cannot see, including the warning that `-m live` clears the PyMOL session it connects to.
+
+### Fixed
+
+- **The README documented two flags that do the opposite of what it said.** `render` was described as taking `ray_trace=False` for "a fast unshaded snapshot", and `turntable` as defaulting to "the fast OpenGL renderer". Both paths were disabled in v1.4.0 — PyMOL's OpenGL frame grab needs its GUI thread, which the plugin does not run on, and it silently wrote blank images — and `rendering.py` forces ray-tracing back on in both tools.
+- **`render`'s tool schema still advertised the fast path v1.4.0 removed.** That release updated `turntable`'s parameter description to say the flag is ignored but left `render`'s promising "a fast unshaded viewport grab", and its docstring recommending the flag for quick checks. The schema is the only one of these an agent ever reads, so the correction had been made everywhere except where it mattered: a model trying to keep a mid-iteration check cheap would ask for the fast path, get a full ray-trace, and on a large assembly hit the socket timeout instead of a quick preview.
+- **`assets/pharmacophore_view.png` was referenced but never committed**, so it rendered as a broken image on GitHub — the only one of twenty image references that did not resolve. Generated through the tools, as the other figures were.
+- **Stale counts.** 87 primitives and 121 tools, not "~85" and 120; 555 tests by default plus 122 opt-in, not 469. Re-derived from the registered tool list and a test collection rather than counted by hand. The module layout table was missing `analysis.py`, `pdbtext.py`, `style.py` and `cli.py`, which have existed since the v1.3.0 split and v1.4.0.
+- **An oversized render deleted the file it told you about.** Above `MCPYMOL_MAX_IMAGE_BYTES`, `render` returns a message instead of the image — but when no `filename` was given it unlinked the temporary PNG on the way out while reporting that the render "is at a temporary file". A 4000×3000 publication render therefore cost minutes and left nothing behind. The file is now kept whenever that branch is taken, and the message names its real path.
+- **The README's images are absolute URLs**, because the README is also the PyPI long description and PyPI does not rewrite relative links — all 17 figures, including the hero image, rendered as broken-image placeholders on the project page. They point at `raw.githubusercontent.com` now. 1.5.0's page keeps its broken images permanently, since a published version is immutable — this release is the fix.
+- **Install instructions assumed a PATH that the recommended installers do not guarantee.** `uv tool install` and `pipx` put `mcpymol` in `~/.local/bin`, which is not universally on PATH — and an MCP client launched by the OS inherits no PATH at all — so registering a bare `mcpymol` failed at client launch with `spawn mcpymol ENOENT` rather than at install time. Every registration command now uses the full path, with a `which mcpymol` check up front.
+- **The `uvx` path documented a bridge with no plugin.** It dropped the clone that used to supply `plugin.py` while still pointing at step 2's `mcpymol --install-plugin`, a command a reader on that path does not have. It now gives `uvx mcpymol --install-plugin` and states the cache-path trade-off plainly.
+- **The `print` extra pointed at the wrong environment.** A bare `pip install 'mcpymol[print]'` resolves to whatever `pip` is first on PATH, which on a Homebrew or Debian Python fails outright and otherwise installs a second copy of MCPymol somewhere the tool venv never sees. Now given per install method.
+- **Upgrade advice was `uv`-only**, including in the row a reader reaches from the "no `uv`" install path, where the single prescribed remedy is the one tool their environment forbids.
+- **The pinned `actions/checkout` SHA was labelled `# v4` but is v7.0.1** — in `ci.yml` since it was written, and copied into `release.yml`. The comment is what Dependabot reads to decide what "within v4" means, so the label being three majors behind the pin invites a silent downgrade.
+- The test command no longer sets `PYTHONPATH=src`, which `pyproject.toml`'s `pythonpath` setting has made redundant.
+
+## [1.5.0] - 2026-08-08
+
+The first release published to PyPI. Every install path used to begin with
+`git clone`, which asked people to take on a checkout in order to run a tool
+they only wanted to use — and left them tracking a branch rather than a
+version.
+
+### Added
+
+- **MCPymol is on PyPI**, so the bridge installs with `uvx mcpymol` and needs
+  no checkout. This is what makes the plugin the interesting half of the
+  install: the bridge is now a one-line registration, while the plugin still
+  has to be found on disk, which is what `--install-plugin` below is for.
+  Publishing uses [Trusted Publishing](https://docs.pypi.org/trusted-publishers/)
+  over OIDC rather than a stored API token, so there is no long-lived
+  credential in the repository to leak or rotate. `.github/workflows/release.yml`
+  fires on a `v*` tag and refuses to upload if the tag disagrees with the
+  version it just built — a published version is immutable, and a wrong one
+  can only be superseded, never replaced.
+- **`mcpymol --install-plugin`**, which adds the plugin to `~/.pymolrc.py` so PyMOL loads it on startup, plus `--plugin-path` and `--uninstall-plugin`. The plugin runs inside PyMOL, whose Python is a separate interpreter that cannot import this package, so it has to be loaded from a file path — and finding that path inside a pip or `uvx` installation is unpleasant. The block is delimited and rewritten in place rather than appended, because the path it embeds points into one installation and goes stale on upgrade; re-running the command is the fix. Existing `.pymolrc.py` content is preserved, and uninstall removes only the managed block.
+
+## [1.4.0] - 2026-08-08
+
+MCPymol could make pictures but could not answer questions with numbers, and
+a good deal of it did not work at all. This release closes both gaps.
+
+### Added
+
+- README figures for `conservation_view` (lysozyme against 5,507 homologues), `print_ribbon_view` (GFP, spine visible through the strands), `textbook_view` (haemoglobin), `cinematic_view` (GroEL down its seven-fold axis), `plddt_view` (AlphaFold spike) and `superposition_view` (adenylate kinase), plus an animated `turntable` GIF. Every documented view now carries an image except `bfactor_view` and `pointillist_view`, which are deliberate: `putty_view` already illustrates the B-factor palette, and the pointillist style is decorative.
+- Real output for `contact_report`, `interface_report` and `structure_info` in the README. These were the headline features of the release and it showed none of what they return. The contact and interface examples use the same systems the `ligand_view` and `interface_view` figures show, so the picture and the numbers sit side by side.
+- All figures were produced through the tools themselves, which is how three of the bugs in this release were found.
+- **Configuration section in the README.** Six of nine `MCPYMOL_*` environment variables were undocumented, including every timeout introduced in v1.3.0. All nine now have a table entry saying what they do and what the default is.
+- Troubleshooting rows for the failure modes introduced since v1.2.1: files not appearing when PyMOL and the bridge are on different machines, oversized renders, AlphaFold entries with no model at a given version, blank views from empty selections, and slow-operation timeouts.
+- `tests/test_docs.py` keeps these true. An environment variable added in code but not the README, a headline tool missing from the README or the skill, a doc that sends readers to `server.py` for implementation, or a `CONTRIBUTING` that stops warning about facade patching — each now fails CI. Written after this audit found six undocumented variables and three unmentioned tools by hand; the point is not to do that by hand again.
+- **A live test suite: `pytest -m live`.** Calls every registered tool once against a running PyMOL. It exists because the mocked suite asserts the payload we *send*, which cannot tell whether PyMOL will accept it — and every wiring bug shipped so far lived in that gap. It asserts only that a tool is *wired* (the action resolves, the arguments bind), not that it succeeds, since many tools error honestly without the right context. Arguments are generated from a table keyed on parameter name, so a new tool is swept automatically, and anything unsuitable must be excluded with a stated reason. It skips cleanly when no PyMOL is listening, and refuses to run against a PyMOL whose camera has stopped responding rather than reporting a hundred confusing failures.
+- **`contact_report`** — lists contacting residue pairs across two selections, closest first, with the minimum heavy-atom distance, the number of atom contacts, and a classification: salt bridge, hydrogen bond, hydrophobic, polar contact, or π-stacking (parallel vs T-shaped by interplanar angle). Criteria are heavy-atom distances, documented and pinned by tests, since crystal structures usually have no hydrogens — so a reported hydrogen bond is a donor–acceptor pair with plausible geometry, not one verified against a hydrogen position. Neighbour search uses a uniform grid, keeping cost linear in atom count; a property test asserts it finds exactly what a brute-force scan does. Ring perception needs bond orders that a PDB dump does not carry, so aromatics cover the standard aromatic amino acids only and ligand rings are reported as hydrophobic rather than mis-called as stacking.
+- **`interface_report`** — buried surface area from ΔSASA (free minus bound, halved for the per-side figure papers quote), residues ranked by how much surface each buries, and a breakdown by residue chemistry. Interprets the number against PDB-wide survey thresholds: under ~400 Å² per side is usually crystal packing, over ~1000 Å² a substantial and likely specific association. Uses `get_area(load_b=1)`, which writes per-atom SASA into the B-factor column, so the whole per-residue breakdown costs one area calculation and one dump rather than hundreds of round trips — and sets `dot_solvent=1` first, without which the numbers are wrong but plausible-looking.
+- **`structure_info`** — what a structure actually is, in one call: chains, atom/residue/water counts, ligands, states and space group from PyMOL, plus title, method, resolution, release date and source organism from the RCSB data API. Best-effort metadata: skipped for objects not named after a PDB entry, degrading to "no metadata" when the network is unavailable. Flags a probable predicted model when the B-factor column looks like pLDDT.
+- **`get_sequence`** — there was previously no way to get a sequence out of MCPymol at all. Returns FASTA plus the two things the sequence hides and that routinely cause silent mistakes: the numbering offset (PDB numbering rarely starts at 1, so "residue 50" in a paper and position 50 in the sequence are usually different residues) and chain breaks where loops went unmodelled.
+- **`sasa`**, **`rms_cur`**, **`count_atoms`** — value-returning primitives. `count_atoms` in particular catches an empty selection, which is otherwise invisible until the render comes out blank.
+- New `mcpymol.pdbtext` module for parsing the PDB dumps that are the only way to read data back out of PyMOL, and `mcpymol.analysis` for the reporting tools.
+
+### Fixed
+
+- **`CONTRIBUTING.md` recommended a test pattern that does not work.** It told contributors to mock `mcpymol.server.send_request`; after the v1.3.0 package split that rebinds only the facade's name, leaving every module still calling the real socket — the exact trap that broke 74 tests during the split. It now shows the correct target and explains why.
+- Docs still pointed at `server.py` for the bridge protocol and for "after editing", both of which moved when the package was split.
+- README claimed 340+ tests (actually 469) and ~60 primitives (actually ~85, of 120 tools).
+- `load_structure` was documented nowhere, so opening a local PDB/mmCIF — a built model, a docking pose, an MD frame — was undiscoverable. `fetch_alphafold` and `count_atoms` were likewise unnamed.
+- **A failed fetch could destroy the session** ([#15](https://github.com/chemrich/MCPymol/issues/15)). `fetch_structure` ran `reinitialize` *before* the fetch, and `cmd.fetch` does not raise when a download fails — it simply produces nothing, which the plugin reports as success. Behind a proxy or VPN blocking the RCSB, fetching one PDB code therefore destroyed every unrelated structure already loaded and returned "Successfully fetched". All three loaders now delete only the object being replaced, verify atoms actually arrived, and clear the rest of the session by name afterwards; settings still get a clean slate via `reinitialize settings`, which does not touch objects.
+- **Seven tools failed on every call** ([#15](https://github.com/chemrich/MCPymol/issues/15)), all from wrappers pointing at functions PyMOL does not have or binding arguments in the wrong order: `as` (a Python keyword, so `getattr(cmd, "as")` can never resolve — the real name is `cmd.show_as`), `util_color_by_element` (→ `util.cnc`), `util_color_secondary` (→ `util.cbss`), `spheroid` (needs an object name, not a selection), `h_fill` (has no selection parameter; the selection was landing in `quiet` and being `int()`d), `sculpt_iterate` (arguments reversed) and `symexp` (needs an object *and* a selection). Names and argument orders were verified by introspecting `cmd` and `pymol.util` in a live PyMOL 3.1, and are now pinned by tests — the existing suite could not catch any of them, because it asserts the payload we send and we were faithfully sending the wrong thing.
+- **`render(ray_trace=False)` and `turntable`'s default produced blank images.** PyMOL's unshaded OpenGL capture needs its GUI thread, and the plugin dispatches on a socket worker thread, so `cmd.png(..., ray=0)` writes a flat empty frame rather than failing. `turntable` defaulted to exactly that path, so every frame of every animation came out blank. Both tools now always ray-trace and say why if asked not to. `render` additionally detects a flat single-colour result and points at `list_objects`/`count_atoms`, which catches the other way a render comes back empty: a scene where nothing is visible.
+- **Every view preset rendered with a transparent background.** They set `bg_color` but never `opaque_background`, so ray-traced output kept an alpha channel: correct in the viewport, transparent in the PNG, which appears white wherever the image is used. 16 of 17 presets were affected, `textbook_view` included (its background is white rather than black, and had the identical bug). Backgrounds now go through `style.set_background()`, and a test fails if any module reaches for `bg_color` directly.
+- **`superposition_view` was unreachable through the documented workflow.** `fetch_structure` calls `reinitialize`, so fetching a second structure wiped the first — leaving nothing to compare, for a tool whose only purpose is comparing two structures. All three loaders (`fetch_structure`, `load_structure`, `fetch_alphafold`) take `replace=False` to add to the session instead of clearing it.
+- **`fetch_alphafold` did not work for any accession.** It built the model URL from a hardcoded `AF-{accession}-F1-model_v4.cif` template. AlphaFold DB has since moved to v6 and *removes* retired versions, so every one of those URLs now 404s — the feature shipped in v1.3.0 and resolved for nothing. It also assumed the filename is keyed by accession, which is untrue for some entries: SARS-CoV-2 spike (P0DTC2) is served as `AF-0000000365840314-model_v1.cif`, so no accession-based filename exists for it in any version.
+  The file URL is now asked for rather than constructed, via AlphaFold DB's prediction API, which handles version drift, non-accession entry IDs and multi-fragment proteins. `model_version` becomes an optional pin that bypasses the lookup, and defaults to unset.
+  Every test for this code mocked `urlopen`, so they proved the URL was *built* correctly and never that it *existed*. A `network`-marked test now resolves and fetches a real model; it is deselected by default so CI stays offline-safe (`pytest -m network` to run it, worth doing before a release).
+- A malformed accession returned a raw `HTTP 400 Bad Request`; it now says which accession failed and what one looks like.
+- **Measurements discarded their results.** `cmd.distance`, `angle` and `dihedral` all return the quantity they measure; the wrappers threw it away and returned "Measured distance between 'X' and 'Y' as 'd1'" or "Executed angle successfully." So you could ask MCPymol to measure something and it would draw the measurement without telling you the number. All three now report the value. PyMOL's -1 "nothing matched" sentinel is reported as a failure rather than as a measurement of -1 — but only for quantities that cannot be negative, since -57.8° is an ordinary α-helical phi.
+
+### Changed
+
+- **Every tool parameter is now documented in the JSON schema.** All 222 parameters across all 120 tools carry `Annotated[..., Field(description=...)]`, so `inputSchema.properties[].description` is populated and the model no longer infers arguments from parameter names — it can see what `spectrum`'s `expression` accepts, what `clip`'s `mode` means, and what syntax `mset` takes. The parameter docs previously lived only in `Args:` docstring blocks, which FastMCP does not read into the schema; the signature is now the single source of truth and the redundant blocks are gone. Verified by diffing every schema across the change: descriptions added, types/defaults/`required` untouched. Four new tests keep it that way — a tool shipping an undocumented, empty or one-word parameter description now fails CI.
+- README reorganised around the question being asked rather than the tool being called, with a "What can I ask?" index and a new Analysis section. The mcpymol-guide skill leads with report-first-then-draw.
+- `views._read_ca_bfactors` and `comparison._parse_ca_coords` now delegate to `pdbtext.parse_atoms`, which additionally handles missing element columns, insertion codes and truncated lines. The two `_distance` implementations are unified on `pdbtext.distance3d`.
+
+### Developer experience
+
+- **Pre-commit hooks that actually cover the gates.** The config had a single hook (the `uv.lock` guard), `pre-commit` was not a declared dependency so nothing installed the binary `CONTRIBUTING.md` told you to run, and the hook was consequently never installed in practice — every check happened only in CI, after a push. Commits now run ruff, ruff-format, mypy, the lockfile guard, and file hygiene (trailing whitespace, final newline, line endings, YAML/TOML validity, merge markers, stray `breakpoint()`, oversized files); pushes run the full test suite, which is too slow at ~16 s to pay per commit. `pre-commit` is in the dev group, and `default_install_hook_types` wires both stages from one `pre-commit install`.
+- The ruff and mypy hooks run via `uv run` rather than pre-commit's own tool repos, so they use exactly the versions in `uv.lock` — the versions CI installs — instead of introducing a second place for tool versions to drift.
+
+### Note on dependencies
+
+The optional `analysis` extra was considered and deliberately not added. For this scope nothing earned it: per-residue SASA comes from PyMOL in two round trips via `get_area(load_b=1)`, and contact search is a spatial-grid problem where numpy would add a second code path for no measurable gain. The core stays dependency-free.
+
+### Tests
+
+- 346 → 469.
+
+## [1.3.0] - 2026-08-07
+
+### Added
+- **`render`** — ray-traces the current scene and returns the image as MCP image content, so the model can actually see what it built and iterate. Previously it had to call `ray`, then `png`, and was left holding a filename it could not inspect. One round trip (`cmd.png(..., ray=1)`), waits for the PNG's IEND terminator rather than mere existence (PyMOL writes from its own thread and can lag the response that reported success), and declines to inline anything over `MCPYMOL_MAX_IMAGE_BYTES` (5 MB) since base64 inflates by a third.
+- **`turntable`** — a 360° PNG sequence plus the `ffmpeg` line to assemble it. Sets the rotation origin to the object first, or the camera orbits the scene centre and the model appears to wobble. Defaults to the OpenGL renderer.
+- **`fetch_alphafold`** and AlphaFold routing in `fetch_structure` — a UniProt accession or `AF-` prefixed identifier (`P69905`, `af-P69905`, `AF-P69905-F1-model_v4`) fetches from AlphaFold DB. PyMOL's `cmd.fetch` only knows the RCSB, so the model is downloaded over HTTP and loaded from a temp file. The anchored UniProt regex cannot match a 4-character PDB code, so the namespaces stay separate.
+- **`plddt_view`** — colours a predicted model by pLDDT in AlphaFold's official palette (dark blue >90, light blue 70–90, yellow 50–70, orange <50) and reports the confidence breakdown. This matters because pLDDT rides in the B-factor column, so `bfactor_view` and `putty_view` read these models exactly backwards — they treat low values as *rigid*, whereas low pLDDT means the prediction is unreliable. Warns when the B-factors do not look like pLDDT.
+- **`superposition_view`** — superposes two structures and colours the mobile one by per-residue CA shift (blue unchanged → red most shifted), naming the worst-shifted residues. An RMSD says a structure moved; this says where. Copies both objects before reading coordinates, because `super`/`align` leave the fit in the object's transformation matrix and the stored coordinates can still be pre-superposition.
+- **`save_session` / `load_session`** — `.pse` round-trips the whole scene (objects, selections, representations, colours, scenes, camera), unlike `save`, which writes bare coordinates. `load_session(merge=True)` adds to the current session instead of replacing it.
+
+### Fixed
+- **A stalled client could wedge PyMOL for the rest of the session.** The plugin's accept loop is single-threaded on purpose (`pymol.cmd` is not thread-safe), but nothing bounded one connection: `_recv_all` read until the peer half-closed, with no timeout on the *accepted* socket — only the listening one. A client that connected and stalled blocked every subsequent command. Accepted sockets now get `MCPYMOL_RECV_TIMEOUT` (30 s), requests are capped at `MCPYMOL_MAX_REQUEST_BYTES` (8 MB), and every failure path answers instead of leaving the bridge to guess at an empty response.
+- **A non-JSON-serializable `cmd` return killed the response.** `json.dumps` raised and the client got nothing back; it now degrades to a repr.
+- **`ray`, `draw`, `mpng`, `png` and `save` used the 10 s interactive socket timeout**, which a 1920×1080 ray trace cannot possibly meet — they now use `MCPYMOL_SLOW_OP_TIMEOUT` (600 s). These were exactly the calls worth waiting for.
+- **`pdb2pqr`/`apbs` ran without a timeout**, so a wedged solver hung the whole MCP server. Bounded by `MCPYMOL_PB_TIMEOUT` (600 s); a missing binary now reports its install command.
+- **`poisson_boltzmann_view` ignored the result of the save it depends on**, so a failure surfaced as a baffling PDB2PQR error about a file that was never written.
+- **Optional arguments could be silently mislabelled.** Every thin wrapper dropped *all* `None` values, collapsing gaps in PyMOL's positional argument list — `ray(height="1080")` with no width sent `["1080"]`, and PyMOL read the height as the width. Unset *trailing* arguments are still dropped; a gap now returns an error naming the missing parameter.
+- **Importing `mcpymol.plugin` bound TCP port 9876**, racing any real PyMOL session. `run plugin.py` inside PyMOL still auto-starts; a library import (the test suite, tooling) no longer does.
+- The multimer cutoff disagreed with itself: the helper defaulted to 5.0 Å while both callers passed 8.0 Å, and the README documented 5 Å. Unified on `DEFAULT_MULTIMER_CUTOFF = 8.0`.
+
+### Changed
+- **`server.py` split into a package.** It had reached 3,207 lines mixing the socket protocol, structure loading, 77 command wrappers, 14 scene presets, an MMseqs2 pipeline and mesh repair. Now `app`, `bridge`, `structures`, `primitives`, `views`, `rendering`, `comparison`, `conservation` and `printing`, with `server.py` as the entry point and re-export facade — `from mcpymol.server import ligand_view` still works. Verified by diffing `mcp.list_tools()` across the change: every tool kept a byte-identical name, description and input schema.
+- **77 duplicated wrapper bodies collapsed into one shared helper.** Each wrapper is still a real `def` — the signature and docstring are the tool's public interface — but the mechanical forwarding lives in `_call`, so a fix lands once instead of 77 times.
+- The `typecheck` CI job now installs the `print` extra. Without it trimesh resolved to `Any` and mypy silently skipped the mesh-repair code entirely; enabling it surfaced two real errors.
+- Accept-loop poll interval cut from 1.0 s to 0.25 s, so `stop_mcp` returns promptly.
+
+### Tests
+- 155 → 346. New coverage for the Poisson/voxel repair paths, the plugin's framing and every `serve_connection` failure path, the solver error handling, and all six new tools.
+- New `tests/test_bridge_roundtrip.py` runs the real bridge against the real plugin listener over TCP on an ephemeral port. Everything else mocks one side or the other, so the wire format was only ever checked against a mock written to match the implementation. It immediately found two bugs (an unoverridable size cap, and the listener reporting the requested port rather than the bound one).
+- New `tests/test_package_layout.py` enforces that a tool added to a module is re-exported, that nothing registers against a second FastMCP instance, and that no module is left unimported (which would silently drop its tools).
+
+## [1.2.1] - 2026-05-18
+
+### Added
+- `.claude/skills/mcpymol-guide/SKILL.md` — a committed Claude Code skill documenting how to drive the mcpymol MCP server: structure prep and the multimer heuristic, the `*_view` preset catalogue, PyMOL selection syntax, rendering, and the 3D-print STL workflow (including the `representation="cartoon"` vs surface trap, verifying the STL with trimesh rather than the viewport, and the `/mcp` reconnect requirement after `server.py` edits). `.gitignore` now tracks `.claude/skills/` while the rest of `.claude/` stays local.
+
+### Fixed
+- `uv.lock` was not regenerated when the version was bumped to 1.2.0, so CI's `uv sync --locked` failed on every branch. The lockfile is back in sync with `pyproject.toml`.
+
+## [1.2.0] - 2026-05-18
+
+### Added
+- `print_ribbon_view` tool — a 3D-print preset that pairs chunky β-strand arrows (and a fat helix) with a continuous backbone "spine" object (`<obj>_spine`, PyMOL `cartoon tube`). Because the tube ignores secondary structure, it runs unbroken through every strand→loop junction; exported together with the chunky cartoon via `print_export(representation="cartoon", method="voxel", voxel_pitch=0.2)` the voxel step fuses them into one watertight solid with no junction discontinuity, and the spine doubles as internal rebar for print rigidity. Configurable `spine_radius`.
+- `print_export` `representation` parameter. `"surface"` (default) is the existing behaviour, unchanged. `"cartoon"` exports the *currently displayed* cartoon geometry of the real objects — preserving per-residue rep flags (hidden loops) and per-object cartoon type (the `cartoon tube` spine) — instead of recreating a temp object and forcing a molecular surface. Groups are isolated by toggling object visibility (one colour per object).
+
+### Fixed
+- `print_export` always exported the molecular **surface**, even when the scene was set up as a cartoon (e.g. by `print_ribbon_view`): it hid all reps on a throwaway temp object and forced `show surface`. The new `representation="cartoon"` path exports the actual displayed ribbon/tube geometry, so `print_ribbon_view` now produces a ribbon STL rather than a surface blob.
+- `_repair_to_stl` voxel method produced fragmented, **non-watertight** output (e.g. a cartoon export came out as 19 loose shells) because it never consolidated the marching-cubes result. It now keeps the largest body and fills holes — the same consolidation the `light` path already does — yielding one watertight, printable solid. Mesh volume is unchanged (no inflation of fine features).
+
+## [1.1.1] - 2026-05-15
+
+### Fixed
+- **Bridge framing.** Both the in-PyMOL plugin and the external bridge now drain TCP responses to EOF (with incremental JSON parsing as a fallback for mock-style peers), instead of truncating at the first 8 KB chunk. Long PyMOL responses — `get_fastastr` on multi-hundred-residue chains, `get_chains` on large assemblies, error tracebacks — no longer corrupt the JSON.
+- **`util.*` tool dispatch.** The plugin previously checked `hasattr(cmd, action)` for every action, so dotted names like `util.cbc` / `util.cbaw` / `util.chainbow` silently failed even though the tools were registered. Plugin now resolves dotted names through `pymol.util` (and falls back to a general attribute walk).
+- **`conservation_view` residue mapping.** Previous version assumed `resi == i + 1` along the FASTA, which silently misaligned scores in structures with non-contiguous residue numbering (gaps, modified termini). Now walks the actual CA `resi` values from PyMOL and maps via a stored dict.
+
+### Performance
+- **`conservation_view`** alter loop collapsed from O(2N) socket round-trips to a single batched `cmd.do` script. For a 300-residue chain this drops from ~10 s of TCP overhead alone to one round-trip.
+
+### Added
+- `list_objects`, `list_chains(obj_name)`, `list_ligands(obj_name)` introspection tools so models can ground themselves in actual session state instead of guessing object names, chain IDs, or 3-letter ligand codes.
+- `python -m mcpymol` entry point via `__main__.py`.
+- GitHub Actions CI running pytest on Python 3.10–3.13.
+- `print_export` tool — exports a structure as watertight, manifold STL files for multi-colour 3D printing. Per-colour-group isolation works around PyMOL's whole-scene OBJ export. Adaptive mesh repair: `auto` does a light cleanup when the export is already watertight (compact barrels like GFP — keeps the largest body, drops internal cavity shells), otherwise screened-Poisson reconstruction with a voxel-remesh fallback (robust for thin nucleic acids); all groups stay in one coordinate frame for slicer assembly. Optional `print` extra (trimesh, pymeshlab, scipy, scikit-image, networkx); degrades gracefully with an install hint when the libraries are absent.
+
+### Changed
+- Tool descriptions for `show`, `hide`, `color`, `select`, `remove`, `distance`, `execute_pymol_command` now enumerate valid argument vocabularies (representation names, color names) and include a brief PyMOL selection-syntax primer. Stronger guardrail on `execute_pymol_command` so models reach for it less.
+- `pyproject.toml` enriched with authors, urls, classifiers, keywords, and a `[tool.pytest.ini_options]` block so `pytest` Just Works from the repo root.
+- `.gitignore` extended to cover `venv/`, `refresh/`, `.vscode/`, `build/`, `dist/`.
+- README rewritten: fixed duplicate "Option C", fixed `yourusername/MCPymol` placeholder, added missing views (`bfactor_view`, `textbook_view`, `cinematic_view`, `pointillist_view`, `conservation_view`), added a how-it-talks architecture diagram, a troubleshooting table, and a "Try it" prompt list.
+- New `CONTRIBUTING.md`.
+
+## [1.1.0] - 2026-03-31
+
+### Added
+- `conservation_view` tool — evolutionary conservation visualization using Shannon entropy
+- MMseqs2 integration via ColabFold public API (configurable for local servers via `MCPYMOL_MMSEQS_URL` env var)
+- Full pipeline: sequence extraction → MSA generation → entropy scoring → B-factor mapping → spectrum coloring
+- A3M parser with insertion-stripping for clean MSA alignment
+- Per-residue Shannon entropy calculation normalized to [0, 1]
+- 18 new tests covering A3M parsing, entropy math, API mocking, and end-to-end conservation_view
+
+## [1.0.0] - 2026-03-30
+
+### Added
+- 50+ auto-generated PyMOL commands exposed as MCP tools (`show`, `hide`, `color`, `distance`, `get_chains`, `select`, and more)
+- Biological assembly fetching with automatic BFS-based multimer heuristic — isolates the functional multimer while discarding crystallographic copies
+- Automatic solvent/water hiding for clean, relevant views
+- Dual-process socket bridge architecture to work around PyMOL's internal Python environment constraints
+- `MCPYMOL_PORT` environment variable for running multiple instances simultaneously
+- Auto-start support via `~/.pymolrc.py`
+- Tested and supported with Claude Code and Gemini CLI

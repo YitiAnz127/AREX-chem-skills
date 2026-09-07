@@ -1,0 +1,219 @@
+import { useEffect, useRef, useState } from "react";
+import { useTranslation } from "react-i18next";
+import { Pencil, Plus, X, PanelLeft } from "lucide-react";
+import { groupLabel, useLayoutStore, type LayoutGroup } from "@/lib/layout";
+import { useOverlayTitlebar, useUiStore } from "@/lib/store";
+import { overlayTitlebarStyle } from "@/lib/titlebar";
+import { cn } from "@/lib/cn";
+import { ContextMenu, ContextMenuItem } from "@/components/ui/ContextMenu";
+import { ConfirmDialog } from "@/components/ui/ConfirmDialog";
+
+/**
+ * Horizontal group/"screen" tab strip at the very top of the live surface —
+ * each tab is one independent pane layout (browser/iTerm style). As the
+ * top-most element it owns the macOS overlay-titlebar clearance (traffic-light
+ * inset + window-drag region), so no pane below needs to.
+ */
+/**
+ * Does closing this Screen need a confirmation?
+ *
+ * Two Screens are worth nothing and close on the click: an empty one, and the
+ * tentative preview a sidebar click just opened and nobody has touched since
+ * (`ephemeralGroupId` — any real interaction pins it, #3). EVERYTHING else asks
+ * first, including a Screen restored by a relaunch: what a Screen holds is not
+ * knowable from the layout alone, and closing one the user had arranged and
+ * worked in is not a thing to do on a stray click.
+ *
+ * An earlier version of this asked only when it could SEE something to lose (an
+ * unsent line, more than one pane). That was wrong the moment the app was
+ * reopened: restored Screens carry real work and it looked like nothing.
+ */
+function closeNeedsConfirm(group: LayoutGroup, ephemeralGroupId: string | null): boolean {
+  if (!group.tree) return false;
+  return group.id !== ephemeralGroupId;
+}
+
+export function GroupTabs() {
+  const { t } = useTranslation(["session", "nav"]);
+  const groups = useLayoutStore((s) => s.groups);
+  const activeGroupId = useLayoutStore((s) => s.activeGroupId);
+  const ephemeralGroupId = useLayoutStore((s) => s.ephemeralGroupId);
+  const setActiveGroup = useLayoutStore((s) => s.setActiveGroup);
+  const addGroup = useLayoutStore((s) => s.addGroup);
+  const closeGroup = useLayoutStore((s) => s.closeGroup);
+  const renameGroup = useLayoutStore((s) => s.renameGroup);
+
+  const sidebarCollapsed = useUiStore((s) => s.sidebarCollapsed);
+  const setSidebarCollapsed = useUiStore((s) => s.setSidebarCollapsed);
+  const overlayTitlebar = useOverlayTitlebar();
+  const isMac = navigator.userAgent.includes("Mac");
+
+  const [editingId, setEditingId] = useState<string | null>(null);
+  const [confirmCloseId, setConfirmCloseId] = useState<string | null>(null);
+  const fallback = (n: number) => t("group.defaultName", { n });
+
+
+  return (
+    <>
+      <div
+        data-tauri-drag-region={overlayTitlebar || undefined}
+        style={overlayTitlebar ? overlayTitlebarStyle(sidebarCollapsed) : undefined}
+        className={cn(
+          // `select-none`: right-clicking a tab used to select its name.
+          "flex shrink-0 select-none items-center gap-1 border-b border-faint px-2",
+          !overlayTitlebar && "h-9",
+        )}
+      >
+        {/* Sidebar expand button: only when collapsed, and it lives here since this
+            strip has taken over the top row (traffic-light clearance included). */}
+        {sidebarCollapsed && (
+          <button
+            onClick={() => setSidebarCollapsed(false)}
+            aria-label={t("nav:sidebar.expand")}
+            title={t("nav:sidebar.expandTitle", { shortcut: isMac ? "⌘B" : "Ctrl+B" })}
+            className="fade-in mr-0.5 rounded p-1 text-text hover:bg-surface-2"
+          >
+            <PanelLeft size={14} strokeWidth={1.5} />
+          </button>
+        )}
+        {/* This row is `flex-1`, so it covers the whole width left of the edge —
+            the empty space beside the tabs included. A bare drag region applies
+            to DIRECT clicks only (Tauri walks the composed path and requires
+            `el === target`), so without the attribute here the only draggable
+            part of the header was the hairline above and below this row. Tabs
+            and the + button stay undraggable: a tab is never the drag element
+            itself, and Tauri treats <button> as clickable, which blocks drag. */}
+        <div
+          data-tauri-drag-region={overlayTitlebar || undefined}
+          className="flex min-w-0 flex-1 items-center gap-1 overflow-x-auto"
+        >
+          {groups.map((g, i) => {
+            const active = g.id === activeGroupId;
+            const ephemeral = g.id === ephemeralGroupId;
+            return (
+              <ContextMenu
+                key={g.id}
+                label={t("group.tabMenu")}
+                items={
+                  <>
+                    <ContextMenuItem
+                      icon={<Pencil size={14} />}
+                      onSelect={() => requestAnimationFrame(() => setEditingId(g.id))}
+                    >
+                      {t("group.rename")}
+                    </ContextMenuItem>
+                    <ContextMenuItem
+                      icon={<X size={14} />}
+                      danger
+                      onSelect={() => setConfirmCloseId(g.id)}
+                    >
+                      {t("group.close")}
+                    </ContextMenuItem>
+                  </>
+                }
+              >
+              <div
+                // Dock-drag target: hovering this tab mid-drag switches screens (#4).
+                data-group-tab={g.id}
+                onClick={() => setActiveGroup(g.id)}
+                onDoubleClick={() => setEditingId(g.id)}
+                className={cn(
+                  "group/tab flex h-7 min-w-0 shrink-0 cursor-pointer items-center gap-1.5 rounded-md px-2.5 text-[12px] transition-colors",
+                  active ? "bg-surface-2 text-text" : "text-muted hover:bg-surface-2/60",
+                  // A tentative (preview) screen reads italic, like a browser preview tab.
+                  ephemeral && "italic",
+                )}
+                title={t("group.renameHint")}
+              >
+                {editingId === g.id ? (
+                  <TabNameInput
+                    initial={g.name}
+                    placeholder={fallback(i + 1)}
+                    onCommit={(name) => {
+                      renameGroup(g.id, name);
+                      setEditingId(null);
+                    }}
+                    onCancel={() => setEditingId(null)}
+                  />
+                ) : (
+                  <span className="max-w-[160px] truncate">{groupLabel(g, i, fallback)}</span>
+                )}
+                {/* Close is always available — closing the last group empties it. */}
+                <button
+                  onClick={(e) => {
+                    e.stopPropagation();
+                    if (closeNeedsConfirm(g, ephemeralGroupId)) setConfirmCloseId(g.id);
+                    else closeGroup(g.id);
+                  }}
+                  aria-label={t("group.close")}
+                  className={cn(
+                    "-mr-1 rounded p-0.5 text-muted hover:bg-border hover:text-text",
+                    active ? "opacity-70" : "opacity-0 group-hover/tab:opacity-70",
+                  )}
+                >
+                  <X size={12} />
+                </button>
+              </div>
+              </ContextMenu>
+            );
+          })}
+          <button
+            onClick={() => addGroup()}
+            aria-label={t("group.newTab")}
+            title={t("group.newTab")}
+            className="shrink-0 rounded-md p-1.5 text-muted hover:bg-surface-2 hover:text-text"
+          >
+            <Plus size={14} strokeWidth={1.5} />
+          </button>
+        </div>
+      </div>
+      {confirmCloseId && (
+        <ConfirmDialog
+          title={t("group.confirmCloseScreen.title")}
+          body={t("group.confirmCloseScreen.body")}
+          confirmLabel={t("group.confirmCloseScreen.action")}
+          onConfirm={() => {
+            closeGroup(confirmCloseId);
+            setConfirmCloseId(null);
+          }}
+          onCancel={() => setConfirmCloseId(null)}
+        />
+      )}
+    </>
+  );
+}
+
+/** Inline rename field for a group tab; commits on Enter/blur, cancels on Esc. */
+function TabNameInput({
+  initial,
+  placeholder,
+  onCommit,
+  onCancel,
+}: {
+  initial: string;
+  placeholder: string;
+  onCommit: (name: string) => void;
+  onCancel: () => void;
+}) {
+  const ref = useRef<HTMLInputElement>(null);
+  const [value, setValue] = useState(initial);
+  useEffect(() => {
+    ref.current?.focus();
+    ref.current?.select();
+  }, []);
+  return (
+    <input
+      ref={ref}
+      value={value}
+      placeholder={placeholder}
+      onClick={(e) => e.stopPropagation()}
+      onChange={(e) => setValue(e.target.value)}
+      onBlur={() => onCommit(value)}
+      onKeyDown={(e) => {
+        if (e.key === "Enter") onCommit(value);
+        else if (e.key === "Escape") onCancel();
+      }}
+      className="h-5 w-28 rounded border border-border bg-surface px-1 text-[12px] text-text outline-none"
+    />
+  );
+}

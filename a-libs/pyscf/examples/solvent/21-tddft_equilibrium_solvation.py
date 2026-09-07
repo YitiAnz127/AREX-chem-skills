@@ -1,0 +1,65 @@
+#!/usr/bin/env python
+#
+# Author: Qiming Sun <osirpt.sun@gmail.com>
+#
+
+'''
+Slow solvent and fast slovent in TDDFT calculations.
+'''
+
+from pyscf import gto
+from pyscf import __all__
+
+mol = gto.M(
+    atom = '''
+H     0.   0.   .917
+F     0.   0.   0.
+''',
+basis = '631g')
+
+#
+# Solvent does not respond to the change of electronic structure in vertical
+# excitation. The calculation can be started with an SCF with fully relaxed
+# solvent and followed by a regular TDDFT method
+#
+mf = mol.RHF().ddCOSMO().run()
+td = mf.TDA()
+td.kernel()
+
+
+#
+# Equilibrium solvation allows the solvent rapidly responds to the electronic
+# structure of excited states. The system should converge to equilibrium
+# between solvent and the excited state of the solute.
+#
+mf = mol.RHF().ddCOSMO().run()
+td = mf.TDA().ddCOSMO()
+td.with_solvent.equilibrium_solvation = True
+td.kernel()
+
+#
+# Switch off the fast solvent
+#
+td.with_solvent.equilibrium_solvation = False
+td.kernel()
+
+#
+# Non-equilibrium solvation is governed by the optical dielectric constant of
+# the solvent, the square of its refractive index. Unless .eps_optical is
+# assigned, the value of water (1.78) is assumed. The SMD model derives
+# .eps_optical from its solvent database automatically.
+#
+mf = mol.RHF().ddCOSMO()
+mf.with_solvent.eps = 7.4257           # tetrahydrofuran
+mf.with_solvent.eps_optical = 1.405**2
+mf.run()
+td = mf.TDA()
+td.kernel()
+
+#
+# The PCM and SMD models can look up both dielectric constants in the solvent
+# database (see examples/solvent/05-pcm.py)
+#
+mf = mol.RHF().PCM('tetrahydrofuran').run()
+td = mf.TDA()
+td.kernel()

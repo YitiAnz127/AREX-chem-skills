@@ -1,0 +1,25 @@
+repos:
+- repo: https://github.com/pre-commit/pre-commit-hooks
+  rev: v6.0.0
+  hooks:
+  - id: check-yaml
+  - id: trailing-whitespace
+    exclude: '\.(pdb|gro|top|sdf|dssp)$'
+  - id: debug-statements
+  - id: mixed-line-ending
+- repo: https://github.com/asottile/add-trailing-comma
+  rev: v4.0.0
+  hooks:
+  - id: add-trailing-comma
+- repo: https://github.com/astral-sh/ruff-pre-commit
+  rev: v0.16.1
+  hooks:
+    - id: ruff
+      args: [--fix]
+    - id: ruff-format
+- repo: https://github.com/tox-dev/pyproject-fmt
+  rev: "v2.26.0"
+  hooks:
+    - id: pyproject-fmt
+ci:
+  autoupdate_schedule: 'monthly'

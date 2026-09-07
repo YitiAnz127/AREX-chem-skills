@@ -1,0 +1,47 @@
+"@context": https://schema.org
+"@type": SoftwareApplication
+"@id": https://github.com/longevity-genie/opengenes-mcp
+
+identifier: longevity-genie/opengenes-mcp
+
+name: Holy-BIO-MCP's OpenGenes server
+
+description: >
+  A Model Context Protocol server for a curated subset of the OpenGenes database, with specialized focus on lifespan interventions and aging research. The server automatically downloads a focused subset of OpenGenes data containing experimental lifespan data.
+
+codeRepository: https://github.com/longevity-genie/opengenes-mcp
+
+url: https://opengenes-mcp.longevity-genie.info/mcp
+
+maintainer:
+  - "@type": Person
+    name: Anton Kulaga
+    identifier: antonkulaga
+    url: https://github.com/antonkulaga
+  - "@type": Person
+    name: Livia Zaharia
+    identifier: livia-zaharia
+    url: https://github.com/livia-zaharia
+
+license: https://spdx.org/licenses/MIT.html
+
+applicationCategory: HealthApplication
+
+keywords:
+  - opengenes
+  - holy-bio-mcp
+  - aging
+  - longevity
+  - lifespan interventions
+  - gerontology
+  - bioinformatics
+  - genetics
+  - model organisms
+  - human population genetics
+
+programmingLanguage:
+  - Python
+
+featureList:
+  - Lifespan interventions on model organisms
+  - OpenGenes aging research database

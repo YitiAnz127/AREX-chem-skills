@@ -1,0 +1,155 @@
+import argparse
+import asyncio
+import json
+import sys
+
+import tiktoken
+from fastmcp import Client
+from rich.console import Console
+
+
+def load_config(mcp_json_path: str) -> dict:
+    with open(mcp_json_path) as f:
+        config = json.load(f)
+    return config
+
+
+async def _get_server_tools(
+    server_cfg: dict,
+    encoding,
+    *,
+    timeout: float,
+) -> dict:
+    """Connect to a single server and return its tools, bounded by a timeout."""
+
+    async def _run() -> dict:
+        client = Client(server_cfg)
+        async with client:
+            tools = await client.list_tools()
+            collected = []
+            for tool in tools:
+                name = getattr(tool, "name", None) or (tool.get("name") if isinstance(tool, dict) else str(tool))
+                description = getattr(tool, "description", None) or (
+                    tool.get("description", "") if isinstance(tool, dict) else ""
+                )
+                input_schema = (
+                    getattr(tool, "inputSchema", None) if not isinstance(tool, dict) else tool.get("inputSchema")
+                )
+                output_schema = (
+                    getattr(tool, "outputSchema", None) if not isinstance(tool, dict) else tool.get("outputSchema")
+                )
+                collected.append(
+                    {
+                        "name": name,
+                        "description": description,
+                        "input_schema": input_schema,
+                        "output_schema": output_schema,
+                    }
+                )
+
+        tools_json = json.dumps(collected, indent=2)
+        token_count = len(encoding.encode(tools_json))
+        return {"tools": collected, "token_count": token_count}
+
+    return await asyncio.wait_for(_run(), timeout=timeout)
+
+
+async def get_tools(  # noqa: PLR0913
+    cfg: dict,
+    *,
+    verbose: bool = False,
+    failures_as_tuples: bool = False,
+    tokenizer: str = "o200k_base",
+    timeout: float = 360.0,
+    concurrency: int = 20,
+) -> tuple[dict, list]:
+    console = Console() if verbose else None
+    grouped: dict[str, dict] = {}
+    failures = []
+    encoding = tiktoken.get_encoding(tokenizer)
+
+    semaphore = asyncio.Semaphore(concurrency)
+
+    async def worker(server: str) -> None:
+        server_cfg = {"mcpServers": {server: cfg["mcpServers"][server]}}
+        async with semaphore:
+            try:
+                grouped[server] = await _get_server_tools(server_cfg, encoding, timeout=timeout)
+                if console is not None:
+                    console.print(f"[green]✓[/green] Tools for {server} were successfully retrieved")
+            except Exception as e:
+                if isinstance(e, asyncio.TimeoutError):
+                    e = TimeoutError(f"timed out after {timeout}s")
+                if failures_as_tuples:
+                    failures.append((server, e))
+                else:
+                    failures.append(f"{server}: {e}")
+
+    await asyncio.gather(*(worker(server) for server in cfg["mcpServers"]))
+
+    output = {"mcp_servers": grouped}
+    return output, failures
+
+
+def main() -> None:
+    parser = argparse.ArgumentParser(description="List MCP tools and schemas from an mcp.json config")
+    parser.add_argument(
+        "--config",
+        dest="config_path",
+        help="Path to mcp.json (required)",
+        required=True,
+    )
+    parser.add_argument(
+        "--output",
+        dest="output_path",
+        help="Path to output file (defaults to stdout if omitted)",
+        default=None,
+    )
+    parser.add_argument(
+        "--verbose",
+        action="store_true",
+        help="Enable verbose logging during tool retrieval",
+    )
+    parser.add_argument(
+        "--show-tokens",
+        action="store_true",
+        help="Display estimated token counts for each server's tools",
+    )
+    args = parser.parse_args()
+    cfg = load_config(args.config_path)
+
+    output, failures = asyncio.run(get_tools(cfg, verbose=args.verbose))
+
+    console = Console()
+
+    if args.show_tokens:
+        # Extract token counts from the output data
+        token_counts = {
+            server: server_data.get("token_count", 0) for server, server_data in output.get("mcp_servers", {}).items()
+        }
+        total_tokens = sum(token_counts.values())
+
+        console.print("\n[bold]Token Usage Estimates:[/bold]")
+        for server, count in token_counts.items():
+            console.print(f"  {server}: [cyan]{count:,}[/cyan] tokens")
+        console.print(f"  [bold]Total: [cyan]{total_tokens:,}[/cyan] tokens[/bold]\n")
+
+    if args.output_path:
+        with open(args.output_path, "w") as f:
+            json.dump(output, f, indent=2, ensure_ascii=False)
+    else:
+        console.print(json.dumps(output, indent=2))
+
+    if failures:
+        console.print("[red]✗[/red] Failed to get tools for the following servers:")
+        for failure in failures:
+            console.print(f"    [red]{failure}[/red]")
+    else:
+        console.print("[green]✓[/green] Tools for all servers were successfully retrieved")
+
+    if not output.get("mcp_servers") and cfg.get("mcpServers"):
+        sys.exit(1)
+
+
+if __name__ == "__main__":
+    main()

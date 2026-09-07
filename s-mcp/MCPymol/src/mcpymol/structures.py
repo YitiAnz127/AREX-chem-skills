@@ -1,0 +1,959 @@
+"""Loading structures and grounding the model in what is loaded.
+
+``fetch_structure`` / ``load_structure`` do the standard prep — biological
+assembly, the BFS multimer heuristic, the default style — and the ``list_*``
+tools let the model check the session state instead of guessing object names,
+chain IDs or ligand codes.
+"""
+
+import itertools
+import json
+import os
+import re
+import tempfile
+import urllib.error
+import urllib.request
+from typing import Annotated
+
+from pydantic import Field
+
+from mcpymol.app import mcp
+from mcpymol.bridge import send_request
+from mcpymol.pdbtext import parse_atoms, residue_order
+from mcpymol.style import black_background
+
+# AlphaFold DB serves predicted models by UniProt accession.  PyMOL's own
+# cmd.fetch only knows the RCSB, so these are downloaded here and loaded from
+# disk.
+# AlphaFold DB's prediction API returns the authoritative file URL for an
+# accession. Asking it beats constructing a filename: the database renumbers
+# its model version periodically (v4 was current in 2024, v6 by 2026) and
+# *removes* the old ones, and some entries — notably the SARS-CoV-2 proteome —
+# are keyed by an internal numeric ID rather than the accession at all, so
+# AF-{acc}-F1-model_v{n} does not exist for them in any version.
+ALPHAFOLD_API_URL = os.environ.get(
+    "MCPYMOL_ALPHAFOLD_API_URL", "https://alphafold.ebi.ac.uk/api/prediction/{acc}"
+)
+
+# Only used when a caller pins model_version explicitly, which bypasses the
+# API lookup.
+ALPHAFOLD_URL = os.environ.get(
+    "MCPYMOL_ALPHAFOLD_URL", "https://alphafold.ebi.ac.uk/files/AF-{acc}-F{frag}-model_v{ver}.cif"
+)
+
+# RCSB's data API supplies the metadata PyMOL does not keep: title, method,
+# resolution, release date, source organism.
+RCSB_DATA_URL = os.environ.get("MCPYMOL_RCSB_URL", "https://data.rcsb.org/rest/v1/core")
+
+# A PDB ID is 4 characters starting with a digit; extended IDs are 12.
+_PDB_ID_RE = re.compile(r"^(pdb_[0-9a-z]{8}|[0-9][a-z0-9]{3})$", re.IGNORECASE)
+
+# UniProt accession format (the official regex from uniprot.org). Deliberately
+# anchored: a 4-character PDB code can never match, so the two namespaces stay
+# distinguishable when routing a bare identifier.
+_UNIPROT_RE = re.compile(
+    r"^([OPQ][0-9][A-Z0-9]{3}[0-9]|[A-NR-Z][0-9]([A-Z][A-Z0-9]{2}[0-9]){1,2})$", re.IGNORECASE
+)
+
+# Chain–chain contact radius for the BFS multimer heuristic.  8 Å keeps
+# sprawling functional assemblies (CRP pentamer, ferritin cage) whole while
+# still dropping crystallographic neighbours.  Single source of truth: the
+# helper's own default used to be 5.0 while every caller passed 8.0, so the
+# signature disagreed with the documented behaviour.
+DEFAULT_MULTIMER_CUTOFF = 8.0
+
+# Ordered green shades used by the ghost heart style
+_GHOST_HEART_GREENS = ["forest", "limegreen", "chartreuse", "palegreen", "lime", "tv_green"]
+
+
+def _clear_other_objects(keep: str) -> None:
+    """Delete every object except ``keep``, then reset settings.
+
+    Replaces a blanket ``reinitialize``, which ran *before* the fetch and so
+    destroyed the session even when the fetch then failed. ``reinitialize
+    settings`` still gives a fresh structure the clean slate it wants — a
+    previous preset's fog or ray_trace_mode would otherwise leak into the new
+    scene — without touching objects.
+    """
+    listed = send_request("get_object_list", args=["all"])
+    if listed.get("status") == "success":
+        for existing in listed.get("result") or []:
+            if existing != keep:
+                send_request("delete", args=[existing])
+    send_request("do", args=["reinitialize settings"])
+
+
+def _verify_loaded(name: str, source: str) -> str | None:
+    """Return an error message if ``name`` came out empty, else None.
+
+    ``cmd.fetch`` does not raise when the download fails — it simply produces
+    no atoms — and the plugin reports success regardless. Without this check a
+    blocked download returned "Successfully fetched" while the caller had
+    nothing, which is the worst kind of reply: confidently wrong.
+    """
+    atoms = _int_result("count_atoms", [f"({name})"])
+    if atoms:
+        return None
+    return (
+        f"Loaded nothing for '{source}': the object '{name}' has no atoms. "
+        f"PyMOL reports success even when a fetch downloads nothing, so this is "
+        f"usually a blocked or failed download — a proxy or VPN in front of the "
+        f"RCSB is the common cause. Nothing else in the session was touched."
+    )
+
+
+def _apply_ghost_heart(name: str):
+    """Applies the ghost heart visualization style to an object.
+
+    Ghost heart = cartoon + semi-transparent surface, chains colored in
+    shades of green, black background.
+    """
+    send_request("show", args=["cartoon", name])
+    send_request("show", args=["surface", name])
+    chains_res = send_request("get_chains", args=[name])
+    if chains_res.get("status") == "success":
+        chains = chains_res.get("result", [])
+        for i, chain in enumerate(chains):
+            green = _GHOST_HEART_GREENS[i % len(_GHOST_HEART_GREENS)]
+            send_request("color", args=[green, f"{name} and chain {chain} and polymer.protein"])
+    send_request("set", args=["transparency", "0.6", name])
+    black_background()
+
+    # Organic cofactors/ligands: sticks, colored by atom with lightblue carbons
+    send_request("show", args=["sticks", f"({name}) and organic"])
+    send_request("do", args=[f"util.cbaw ({name}) and organic"])
+    send_request("color", args=["lightblue", f"({name}) and organic and elem C"])
+
+    # Inorganic ions and metals: spheres, colored by chemical element
+    send_request("show", args=["spheres", f"({name}) and inorganic"])
+    send_request("color", args=["atomic", f"({name}) and inorganic"])
+    send_request("set", args=["sphere_scale", "0.3", f"({name}) and inorganic"])
+
+    # Nucleic acids (DNA/RNA): brightorange backbone, deepteal ladders
+    na_sel = f"({name}) and polymer.nucleic"
+    send_request("set", args=["cartoon_nucleic_acid_color", "brightorange", na_sel])
+    send_request("set", args=["cartoon_ladder_color", "deepteal", na_sel])
+
+    # Center view and set rotation pivot to structure center
+    send_request("center", args=[name])
+    send_request("do", args=[f"origin {name}"])
+
+
+def _apply_multimer_heuristic(name: str, cutoff: float = DEFAULT_MULTIMER_CUTOFF):
+    """BFS expansion to find all connected chains in a multimer."""
+    # 1. Get initial chains
+    res = send_request("get_chains", args=[name])
+    if res.get("status") != "success" or not res.get("result"):
+        return
+
+    all_chains = res.get("result", [])  # guard above guarantees this is populated
+    kept_chains = {all_chains[0]}
+
+    # 2. Expand until stable
+    while True:
+        chain_sel = "+".join(list(kept_chains))
+        # Find chains nearby the current set
+        nearby_res = send_request(
+            "get_chains",
+            args=[
+                f"({name} and not chain {chain_sel}) and bychain (({name} and chain {chain_sel}) around {cutoff})"
+            ],
+        )
+
+        if nearby_res.get("status") == "success":
+            new_chains = [c for c in nearby_res.get("result", []) if c in all_chains]
+            if new_chains and not set(new_chains).issubset(kept_chains):
+                kept_chains.update(new_chains)
+                continue
+        break
+
+    # 3. Apply the removal
+    final_sel = "+".join(list(kept_chains))
+    send_request("remove", args=[f"({name}) and not chain {final_sel}"])
+    send_request("hide", args=["everything", f"({name}) and solvent"])
+
+
+def _alphafold_accession(identifier: str) -> str | None:
+    """Return the UniProt accession if ``identifier`` names an AlphaFold model.
+
+    Accepts what people actually type: ``af-P12345``, ``AF-P12345-F1``, the
+    full ``AF-P12345-F1-model_v4`` filename, or a bare accession.  Returns None
+    for anything else (notably 4-character PDB codes), so the caller can fall
+    through to the RCSB.
+    """
+    ident = identifier.strip()
+    if not ident:
+        return None
+
+    upper = ident.upper()
+    if upper.startswith("AF-") or upper.startswith("AF_"):
+        # AF-P12345-F1-model_v4 → P12345
+        acc = re.split(r"[-_]", ident[3:])[0]
+        return acc.upper() if _UNIPROT_RE.match(acc) else None
+
+    # A bare accession. PDB codes are exactly four characters and can never
+    # match the UniProt pattern, so this does not shadow them.
+    return upper if _UNIPROT_RE.match(ident) else None
+
+
+def _resolve_alphafold_url(accession: str, fragment: int = 1) -> tuple[str | None, str]:
+    """Ask AlphaFold DB for the model file URL. Returns (url, message)."""
+    api = ALPHAFOLD_API_URL.format(acc=accession)
+    try:
+        with urllib.request.urlopen(api, timeout=30) as resp:
+            entries = json.loads(resp.read().decode())
+    except urllib.error.HTTPError as e:
+        # 400 is what the API returns for a malformed accession, 404/422 for a
+        # well-formed one it has no model for. Both are the caller's problem to
+        # fix and neither is worth surfacing as a raw HTTP code.
+        if e.code in (400, 404, 422):
+            return None, (
+                f"AlphaFold DB has no prediction for '{accession}'. Check the UniProt "
+                f"accession (e.g. P69905) — note that not every protein has a model."
+            )
+        return None, f"AlphaFold DB returned HTTP {e.code} for {accession}: {e.reason}"
+    except (urllib.error.URLError, TimeoutError) as e:
+        return None, f"Could not reach AlphaFold DB ({api}): {e}"
+    except ValueError as e:
+        return None, f"AlphaFold DB returned an unreadable response for {accession}: {e}"
+
+    if not entries:
+        return None, f"AlphaFold DB has no prediction for '{accession}'."
+
+    # Long proteins are split into fragments; entries come back in order.
+    index = max(0, fragment - 1)
+    if index >= len(entries):
+        return None, (
+            f"AlphaFold DB has {len(entries)} fragment(s) for '{accession}', "
+            f"so fragment {fragment} does not exist."
+        )
+
+    url = entries[index].get("cifUrl") or entries[index].get("pdbUrl")
+    if not url:
+        return None, f"AlphaFold DB returned no model file URL for '{accession}'."
+    return url, ""
+
+
+def _download_alphafold(
+    accession: str, version: int | None = None, fragment: int = 1
+) -> tuple[str | None, str]:
+    """Download an AlphaFold model to a temp file. Returns (path, message).
+
+    ``version`` pins a specific model version, which skips the API lookup and
+    builds the legacy filename. Leave it unset to let the database say which
+    file is current — versions are retired, so a pin that worked last year may
+    404 today.
+    """
+    if version is None:
+        url, error = _resolve_alphafold_url(accession, fragment)
+        if url is None:
+            return None, error
+    else:
+        url = ALPHAFOLD_URL.format(acc=accession, frag=fragment, ver=version)
+
+    try:
+        with urllib.request.urlopen(url, timeout=60) as resp:
+            data = resp.read()
+    except urllib.error.HTTPError as e:
+        if e.code == 404:
+            pinned = f" (model_v{version})" if version is not None else ""
+            return None, (
+                f"No AlphaFold model file for '{accession}'{pinned} at {url}. "
+                f"Model versions are retired as the database is rebuilt; omit "
+                f"model_version to use whichever is current."
+            )
+        return None, f"AlphaFold DB returned HTTP {e.code} for {accession}: {e.reason}"
+    except (urllib.error.URLError, TimeoutError) as e:
+        return None, f"Could not reach AlphaFold DB ({url}): {e}"
+
+    if not data:
+        return None, f"AlphaFold DB returned an empty file for {accession}."
+
+    fd, path = tempfile.mkstemp(suffix=".cif", prefix=f"AF-{accession}-")
+    with os.fdopen(fd, "wb") as fh:
+        fh.write(data)
+    return path, ""
+
+
+@mcp.tool()
+def fetch_structure(
+    pdb_code: Annotated[
+        str,
+        Field(
+            description='4-letter PDB code (e.g. "1abc"), or an AlphaFold identifier (e.g. "P69905", "af-P69905").'
+        ),
+    ],
+    obj_name: Annotated[
+        str | None, Field(description="Optional custom name for the object in PyMOL")
+    ] = None,
+    multimer_cutoff: Annotated[
+        float,
+        Field(
+            description="Distance (A) between chains to keep them in the same multimer. Default 8.0A is suitable for most functional assemblies."
+        ),
+    ] = DEFAULT_MULTIMER_CUTOFF,
+    replace: Annotated[
+        bool,
+        Field(
+            description="Clear the session first, so this is the only structure "
+            "loaded. Pass False to add to what is already loaded — which is how "
+            "you get two structures into one session for superposition_view."
+        ),
+    ] = True,
+) -> str:
+    """
+    Fetches a protein structure from the PDB, or a predicted model from AlphaFold DB.
+
+    By default, it attempts to fetch the first biological assembly (multimer),
+    and removes any unrelated chains/states that are not part of the primary multimer.
+
+    A UniProt accession or an ``AF-`` prefixed identifier routes to AlphaFold DB
+    instead and is coloured by pLDDT confidence — see :func:`fetch_alphafold`.
+    """
+    accession = _alphafold_accession(pdb_code)
+    if accession is not None:
+        return fetch_alphafold(uniprot_id=accession, obj_name=obj_name, replace=replace)
+
+    name = obj_name if obj_name else pdb_code
+
+    # Only ever delete the object being replaced. Clearing the session comes
+    # after the fetch is known to have produced something, so a failed download
+    # cannot cost the caller everything they had loaded.
+    send_request("delete", args=[name])
+
+    res = send_request("fetch", args=[pdb_code, name])
+    if res.get("status") == "error":
+        return f"Error fetching {pdb_code}: {res.get('error')}"
+
+    empty = _verify_loaded(name, pdb_code)
+    if empty:
+        return empty
+
+    if replace:
+        _clear_other_objects(name)
+    send_request("set", args=["mouse_wheel_scale", "0.1"])
+
+    _apply_multimer_heuristic(name, multimer_cutoff)
+    _apply_ghost_heart(name)
+    send_request("zoom", args=[name])
+    return f"Successfully fetched {pdb_code} as '{name}' with ghost heart style and BFS multimer heuristic (cutoff={multimer_cutoff}A)."
+
+
+@mcp.tool()
+def load_structure(
+    file_path: Annotated[str, Field(description="Path to the structure file (PDB, MMCIF, etc.)")],
+    obj_name: Annotated[str, Field(description="Name for the object in PyMOL")],
+    multimer_cutoff: Annotated[
+        float,
+        Field(
+            description="Distance (A) between chains to keep them in the same multimer. Default 8.0A is suitable for most functional assemblies."
+        ),
+    ] = DEFAULT_MULTIMER_CUTOFF,
+    replace: Annotated[
+        bool,
+        Field(
+            description="Clear the session first, so this is the only structure "
+            "loaded. Pass False to add to what is already loaded — which is how "
+            "you get two structures into one session for superposition_view."
+        ),
+    ] = True,
+) -> str:
+    """
+    Loads a structure from a local file path and applies the BFS multimer heuristic.
+    """
+    send_request("delete", args=[obj_name])
+    res = send_request("load", args=[file_path, obj_name])
+    if res.get("status") == "error":
+        return f"Error loading {file_path}: {res.get('error')}"
+
+    empty = _verify_loaded(obj_name, file_path)
+    if empty:
+        return empty
+
+    if replace:
+        _clear_other_objects(obj_name)
+    send_request("set", args=["mouse_wheel_scale", "0.1"])
+
+    _apply_multimer_heuristic(obj_name, multimer_cutoff)
+    _apply_ghost_heart(obj_name)
+    send_request("zoom", args=[obj_name])
+    return f"Successfully loaded {file_path} as '{obj_name}' with ghost heart style and BFS multimer heuristic (cutoff={multimer_cutoff}A)."
+
+
+@mcp.tool()
+def fetch_alphafold(
+    uniprot_id: Annotated[
+        str,
+        Field(
+            description='UniProt accession (e.g. "P69905" for human haemoglobin alpha). An "AF-" prefix is accepted and stripped.'
+        ),
+    ],
+    obj_name: Annotated[
+        str | None, Field(description="Optional custom name for the object in PyMOL.")
+    ] = None,
+    model_version: Annotated[
+        int | None,
+        Field(
+            description="Pin a specific AlphaFold model version. Leave unset (the "
+            "default) to use whichever version the database currently serves — "
+            "old versions are retired and stop resolving."
+        ),
+    ] = None,
+    fragment: Annotated[
+        int,
+        Field(
+            description="Fragment number for long proteins split across models (F1, F2, …). Most entries only have F1."
+        ),
+    ] = 1,
+    replace: Annotated[
+        bool,
+        Field(
+            description="Clear the session first, so this is the only structure "
+            "loaded. Pass False to add to what is already loaded — which is how "
+            "you get two structures into one session for superposition_view."
+        ),
+    ] = True,
+) -> str:
+    """
+    Fetches a predicted structure from AlphaFold DB by UniProt accession.
+
+    These are *predictions*, not experimental structures, so the model is
+    coloured by pLDDT confidence rather than the usual style — dark blue is
+    reliable, orange is essentially unmodelled. Read the orange and yellow
+    regions as "probably disordered or wrong", not as flexible loops.
+
+    Note that pLDDT rides in the B-factor column, so ``bfactor_view`` and
+    ``putty_view`` will mis-colour these models (they assume low = rigid,
+    which is backwards for confidence). Use ``plddt_view`` instead.
+    """
+    accession = _alphafold_accession(uniprot_id) or uniprot_id.strip().upper()
+    name = obj_name if obj_name else f"AF_{accession}"
+
+    path, error = _download_alphafold(accession, model_version, fragment)
+    if path is None:
+        return error
+
+    try:
+        send_request("delete", args=[name])
+
+        res = send_request("load", args=[path, name], timeout=120.0)
+        if res.get("status") == "error":
+            return f"Error loading AlphaFold model for {accession}: {res.get('error')}"
+
+        empty = _verify_loaded(name, accession)
+        if empty:
+            return empty
+
+        if replace:
+            _clear_other_objects(name)
+        send_request("set", args=["mouse_wheel_scale", "0.1"])
+    finally:
+        try:
+            os.unlink(path)
+        except OSError:
+            pass
+
+    # A predicted monomer — the multimer heuristic has nothing to do here.
+    from mcpymol.views import plddt_view
+
+    summary = plddt_view(obj_name=name)
+    version_note = f" (pinned v{model_version})" if model_version is not None else ""
+    return (
+        f"Fetched AlphaFold model for {accession}, fragment {fragment}{version_note}, "
+        f"as '{name}'.\n{summary}"
+    )
+
+
+def _int_result(action: str, args: list) -> int | None:
+    """Run a PyMOL command that returns a count, or None if it did not."""
+    res = send_request(action, args=args)
+    if res.get("status") == "error":
+        return None
+    try:
+        return int(res.get("result"))  # type: ignore[arg-type]
+    except (TypeError, ValueError):
+        return None
+
+
+def _rcsb_get(path: str, timeout: float = 20.0):
+    """Best-effort GET against the RCSB data API. Returns None on any failure.
+
+    Metadata is a nice-to-have on top of what PyMOL already knows, so a slow
+    or unreachable API must degrade to "no metadata" rather than fail the tool.
+    """
+    try:
+        with urllib.request.urlopen(f"{RCSB_DATA_URL}/{path}", timeout=timeout) as resp:
+            return json.loads(resp.read().decode())
+    except (urllib.error.URLError, TimeoutError, ValueError, OSError):
+        return None
+
+
+def _rcsb_metadata(pdb_id: str) -> dict:
+    """Title, method, resolution, release date and organisms for a PDB entry."""
+    entry = _rcsb_get(f"entry/{pdb_id}")
+    if not entry:
+        return {}
+
+    info: dict = {}
+    if title := (entry.get("struct") or {}).get("title"):
+        info["title"] = title.strip()
+
+    methods = [m.get("method") for m in entry.get("exptl") or [] if m.get("method")]
+    if methods:
+        info["method"] = ", ".join(methods)
+
+    entry_info = entry.get("rcsb_entry_info") or {}
+    resolutions = entry_info.get("resolution_combined") or []
+    if resolutions:
+        info["resolution"] = resolutions[0]
+
+    released = (entry.get("rcsb_accession_info") or {}).get("initial_release_date")
+    if released:
+        info["released"] = released[:10]
+
+    # Source organism lives on the polymer entities, one extra call each; two
+    # is enough to name a complex without turning this into a crawl.
+    entity_ids = (entry.get("rcsb_entry_container_identifiers") or {}).get(
+        "polymer_entity_ids"
+    ) or []
+    organisms: list[str] = []
+    for entity_id in entity_ids[:2]:
+        entity = _rcsb_get(f"polymer_entity/{pdb_id}/{entity_id}", timeout=10.0)
+        for source in (entity or {}).get("rcsb_entity_source_organism") or []:
+            name = source.get("ncbi_scientific_name")
+            if name and name not in organisms:
+                organisms.append(name)
+    if organisms:
+        info["organisms"] = organisms
+    return info
+
+
+@mcp.tool()
+def structure_info(
+    obj_name: Annotated[str, Field(description='PyMOL object to describe (e.g. "1hsg").')],
+    pdb_id: Annotated[
+        str | None,
+        Field(
+            description="PDB code to look up, if the object was renamed and its name no longer matches the entry."
+        ),
+    ] = None,
+) -> str:
+    """
+    Summarises what a loaded structure actually is, in one call.
+
+    Answers the question you ask before any analysis: what protein is this,
+    how was it determined, at what resolution, what is in the file. Combines
+    what PyMOL knows (chains, residue and atom counts, ligands, symmetry)
+    with entry metadata from the RCSB (title, method, resolution, release
+    date, source organism).
+
+    Metadata lookup is best-effort — it is skipped silently if the object is
+    not named after a PDB entry, or the API is unreachable.
+    """
+    lines: list[str] = []
+
+    chains_res = send_request("get_chains", args=[obj_name])
+    if chains_res.get("status") == "error":
+        return f"Error inspecting '{obj_name}': {chains_res.get('error')}"
+    chains = chains_res.get("result") or []
+
+    code = (pdb_id or obj_name).strip()
+    meta = _rcsb_metadata(code.lower()) if _PDB_ID_RE.match(code) else {}
+
+    header = f"{obj_name}"
+    if meta.get("title"):
+        header += f" — {meta['title']}"
+    lines.append(header)
+
+    provenance = []
+    if meta.get("method"):
+        provenance.append(meta["method"])
+    if meta.get("resolution") is not None:
+        provenance.append(f"{meta['resolution']:.2f} A resolution")
+    if meta.get("released"):
+        provenance.append(f"released {meta['released']}")
+    if provenance:
+        lines.append("  " + ", ".join(provenance))
+    if meta.get("organisms"):
+        lines.append(f"  Source: {', '.join(meta['organisms'])}")
+
+    counts = []
+    for label, selection in (
+        ("atoms", f"({obj_name})"),
+        ("residues", f"({obj_name}) and polymer and name CA"),
+        ("waters", f"({obj_name}) and solvent"),
+    ):
+        n = _int_result("count_atoms", [selection])
+        if n is not None:
+            counts.append(f"{n:,} {label}")
+    if counts:
+        lines.append("  " + ", ".join(counts))
+
+    if chains:
+        lines.append(f"  Chains ({len(chains)}): {', '.join(chains)}")
+    else:
+        lines.append("  No chains found — is the object loaded?")
+
+    ligand_summary = list_ligands(obj_name=obj_name)
+    lines.append(f"  {ligand_summary}")
+
+    n_states = _int_result("count_states", [obj_name])
+    if n_states is not None and n_states > 1:
+        lines.append(f"  {n_states} states (NMR ensemble or trajectory)")
+
+    symmetry = send_request("get_symmetry", args=[obj_name])
+    sym = symmetry.get("result")
+    if isinstance(sym, (list, tuple)) and len(sym) >= 7 and sym[6]:
+        lines.append(f"  Space group {sym[6]}, cell {sym[0]:.1f} x {sym[1]:.1f} x {sym[2]:.1f} A")
+
+    # An AlphaFold model has confidence, not temperature, in the B-factor
+    # column — worth flagging, because it changes which tools are meaningful.
+    dump = send_request("get_pdbstr", args=[f"({obj_name}) and name CA"], timeout=60.0)
+    bfactors = [a.bfactor for a in parse_atoms(dump.get("result") or "", ca_only=True)]
+    if bfactors and not meta and min(bfactors) >= 0.0 and max(bfactors) <= 100.0:
+        lines.append(
+            f"  B-factors span {min(bfactors):.1f}-{max(bfactors):.1f}; if this is a "
+            f"predicted model that column is pLDDT — use plddt_view, not bfactor_view."
+        )
+
+    return "\n".join(lines)
+
+
+@mcp.tool()
+def get_sequence(
+    obj_name: Annotated[str, Field(description='PyMOL object (e.g. "1hsg").')],
+    chain: Annotated[
+        str | None, Field(description="Chain to extract. Omit for every chain in the object.")
+    ] = None,
+) -> str:
+    """
+    Returns the amino-acid sequence of a loaded structure, in FASTA.
+
+    Also reports how the sequence positions line up with the residue numbers
+    in the file, and where the chain is broken. Both matter: PDB numbering
+    rarely starts at 1, so "residue 50" in a paper and position 50 in the
+    sequence are usually different residues — and unmodelled loops leave gaps
+    in the structure that the sequence alone does not reveal.
+    """
+    selection = f"({obj_name}) and polymer.protein"
+    if chain:
+        selection += f" and chain {chain}"
+
+    fasta_res = send_request("get_fastastr", args=[selection], timeout=60.0)
+    if fasta_res.get("status") == "error":
+        return f"Error reading sequence from '{obj_name}': {fasta_res.get('error')}"
+
+    fasta = (fasta_res.get("result") or "").strip()
+    if not fasta:
+        where = f"chain {chain} of " if chain else ""
+        return f"No protein sequence found in {where}'{obj_name}'."
+
+    lines = [fasta, ""]
+
+    dump = send_request("get_pdbstr", args=[f"{selection} and name CA"], timeout=60.0)
+    residues = parse_atoms(dump.get("result") or "", ca_only=True)
+    if not residues:
+        return fasta
+
+    by_chain: dict[str, list] = {}
+    for atom in residues:
+        by_chain.setdefault(atom.chain, []).append(atom)
+
+    for chain_id, atoms in by_chain.items():
+        atoms.sort(key=lambda a: residue_order(a.resi))
+        first, last = atoms[0], atoms[-1]
+        label = f"Chain {chain_id or '(blank)'}"
+        lines.append(
+            f"{label}: {len(atoms)} modelled residues, numbered "
+            f"{first.resi}-{last.resi} ({first.resn}{first.resi} to {last.resn}{last.resi})."
+        )
+        if first.resi.isdigit() and int(first.resi) != 1:
+            lines.append(
+                f"  Numbering starts at {first.resi}, so sequence position 1 is "
+                f"residue {first.resi} — offset by {int(first.resi) - 1}."
+            )
+
+        gaps = []
+        for previous, current in itertools.pairwise(atoms):
+            start, end = residue_order(previous.resi)[0], residue_order(current.resi)[0]
+            if end - start > 1:
+                gaps.append(f"{previous.resi}->{current.resi} ({end - start - 1} missing)")
+        if gaps:
+            lines.append(f"  Chain breaks (unmodelled): {', '.join(gaps)}")
+
+    return "\n".join(lines)
+
+
+# Fields worth having by default: identity, then the two per-atom columns that
+# have nowhere else to live.
+DEFAULT_ATOM_PROPERTIES = "chain, resi, resn, name, b, q"
+
+
+def _split_properties(properties: str) -> list[str]:
+    """Split a property list on commas that separate *fields*.
+
+    ``properties`` is a Python expression list evaluated by ``iterate``, so a
+    comma inside brackets or quotes belongs to the expression, not to the
+    list. Splitting on every comma tore an expression like
+    ``resi in ('1','2')`` into fragments that were then handed to PyMOL as
+    separate field names — a confusing per-fragment error, or worse a partial
+    result, in a tool whose whole point is reaching data no other view shows.
+    """
+    fields: list[str] = []
+    current: list[str] = []
+    depth = 0
+    quote: str | None = None
+
+    for char in properties:
+        if quote is not None:
+            current.append(char)
+            if char == quote:
+                quote = None
+            continue
+        if char in "\"'":
+            quote = char
+            current.append(char)
+        elif char in "([{":
+            depth += 1
+            current.append(char)
+        elif char in ")]}":
+            depth = max(0, depth - 1)
+            current.append(char)
+        elif char == "," and depth == 0:
+            fields.append("".join(current))
+            current = []
+        else:
+            current.append(char)
+
+    fields.append("".join(current))
+    return [f.strip() for f in fields if f.strip()]
+
+
+@mcp.tool()
+def atom_properties(
+    selection: Annotated[
+        str,
+        Field(
+            description='Atoms to read, e.g. "1hsg and chain A and resi 25". Narrow '
+            "this: a whole protein is thousands of atoms."
+        ),
+    ],
+    properties: Annotated[
+        str,
+        Field(
+            description="Comma-separated PyMOL atom properties. Common ones: chain, "
+            "resi, resn, name, elem, b (B-factor or pLDDT), q (occupancy), alt "
+            "(altloc), formal_charge, partial_charge, ss, segi, index."
+        ),
+    ] = DEFAULT_ATOM_PROPERTIES,
+    max_atoms: Annotated[
+        int, Field(description="How many atoms to list. Any omitted are counted.")
+    ] = 50,
+) -> str:
+    """
+    Reads per-atom properties, which nothing else in the tool set can reach.
+
+    Object-level facts come back through ``structure_info`` and ``list_chains``,
+    and per-residue values through ``get_sequence`` or the view presets. But
+    properties that live on individual *atoms* — occupancy, alternate
+    conformations, per-atom B-factor, formal charge — have no other route: the
+    PyMOL call that exposes them returns an object that cannot cross the bridge.
+
+    Use it to check what you are actually looking at: partial occupancy where a
+    sidechain has two conformations, per-atom pLDDT inside a predicted model, or
+    which atoms carry a formal charge before reasoning about electrostatics.
+
+    ``properties`` is evaluated by PyMOL once per atom, so it accepts any
+    expression valid in ``iterate`` — the names above are the useful subset.
+    """
+    fields = _split_properties(properties)
+    if not fields:
+        return "Error: no properties requested, e.g. properties='chain, resi, b'."
+    if max_atoms < 1:
+        return f"Error: max_atoms must be at least 1, got {max_atoms}."
+
+    res = send_request("iterate_to_list", args=[selection, ", ".join(fields)], timeout=120.0)
+    if res.get("status") == "error":
+        return f"Error reading '{selection}': {res.get('error')}"
+
+    rows = res.get("result") or []
+    if not rows:
+        return (
+            f"No atoms matched '{selection}'. Check the object name and selection "
+            f"syntax with count_atoms."
+        )
+
+    widths = [len(f) for f in fields]
+    for row in rows[:max_atoms]:
+        for i, value in enumerate(row[: len(fields)]):
+            widths[i] = max(widths[i], len(_format_atom_value(value)))
+
+    lines = [f"{len(rows)} atoms in '{selection}':", ""]
+    lines.append("  " + "  ".join(f.ljust(w) for f, w in zip(fields, widths, strict=False)))
+    for row in rows[:max_atoms]:
+        cells = [_format_atom_value(v) for v in row[: len(fields)]]
+        lines.append("  " + "  ".join(c.ljust(w) for c, w in zip(cells, widths, strict=False)))
+
+    if len(rows) > max_atoms:
+        lines.append(f"  ... and {len(rows) - max_atoms} more atoms (raise max_atoms).")
+    return "\n".join(lines)
+
+
+def _format_atom_value(value) -> str:
+    """Render one property value compactly; floats to 2 dp, blanks visible."""
+    if isinstance(value, float):
+        return f"{value:.2f}"
+    text = str(value)
+    return text if text else "-"
+
+
+# ── Sessions ─────────────────────────────────────────────────────────────────
+
+# PyMOL decides it is writing a session from the extension, so these are the
+# only two that round-trip a whole scene rather than bare coordinates.
+_SESSION_SUFFIXES = (".pse", ".pse.gz")
+
+
+@mcp.tool()
+def save_session(
+    filename: Annotated[
+        str, Field(description="Path to write. A ``.pse`` extension is added if missing.")
+    ],
+) -> str:
+    """
+    Saves the entire PyMOL session to a .pse file.
+
+    A session captures everything — every object, selection, representation,
+    colour, scene and the camera — so the work can be reopened exactly as it
+    was. Use this before experimenting with a scene you would not want to
+    rebuild, and to hand a finished figure to a colleague.
+
+    Unlike ``save``, which writes bare coordinates, this preserves the whole
+    visual state.
+    """
+    path = os.path.abspath(os.path.expanduser(filename.strip()))
+    if not path.lower().endswith(_SESSION_SUFFIXES):
+        path += ".pse"
+
+    parent = os.path.dirname(path)
+    if parent:
+        os.makedirs(parent, exist_ok=True)
+
+    res = send_request("save", args=[path], timeout=300.0)
+    if res.get("status") == "error":
+        return f"Error saving session: {res.get('error')}"
+
+    if not os.path.exists(path):
+        return (
+            f"PyMOL reported success but no file appeared at {path}. If PyMOL is "
+            f"running on a different machine than this bridge, they cannot "
+            f"exchange files."
+        )
+    return f"Saved session to {path} ({os.path.getsize(path) / 1e6:.1f} MB)."
+
+
+@mcp.tool()
+def load_session(
+    filename: Annotated[str, Field(description="Path to the .pse file to open.")],
+    merge: Annotated[
+        bool, Field(description="Add to the current session rather than replacing it.")
+    ] = False,
+) -> str:
+    """
+    Restores a PyMOL session from a .pse file.
+
+    By default this replaces everything currently loaded, exactly as opening
+    the file in PyMOL would. Set ``merge=True`` to add its objects to the
+    current session instead, which is how you get two saved scenes side by
+    side — though note that objects with the same name will collide.
+    """
+    path = os.path.abspath(os.path.expanduser(filename.strip()))
+    if not os.path.exists(path):
+        return f"Error: no such file: {path}"
+    if not path.lower().endswith(_SESSION_SUFFIXES):
+        return (
+            f"Error: {path} is not a PyMOL session (.pse). Use load_structure "
+            f"for coordinate files such as PDB or mmCIF."
+        )
+
+    kwargs = {"partial": 1} if merge else {}
+    res = send_request("load", args=[path], kwargs=kwargs, timeout=300.0)
+    if res.get("status") == "error":
+        return f"Error loading session: {res.get('error')}"
+
+    listed = send_request("get_object_list", args=["all"])
+    objects = listed.get("result") or [] if listed.get("status") == "success" else []
+    how = "Merged" if merge else "Loaded"
+    summary = ", ".join(objects) if objects else "no objects"
+    return f"{how} session {path}. Objects now in the session: {summary}."
+
+
+# ── Scene introspection ──────────────────────────────────────────────────────
+
+
+@mcp.tool()
+def list_objects() -> str:
+    """Lists all loaded PyMOL objects.
+
+    Call this when you don't know what's currently in the session — for
+    example before composing a selection or running a view tool that needs
+    an ``obj_name``.
+    """
+    res = send_request("get_object_list", args=["all"])
+    if res.get("status") == "error":
+        return res.get("error", "Unknown error")
+    objs = res.get("result") or []
+    if not objs:
+        return "No objects are loaded."
+    return "Loaded objects: " + ", ".join(objs)
+
+
+@mcp.tool()
+def list_chains(
+    obj_name: Annotated[
+        str, Field(description="Object to inspect. Defaults to every loaded object.")
+    ] = "all",
+) -> str:
+    """
+    Lists the chain IDs present in an object (or in all objects).
+
+    Useful before calling :func:`interface_view`, :func:`conservation_view`
+    or any tool that needs a specific chain ID.
+    """
+    res = send_request("get_chains", args=[obj_name])
+    if res.get("status") == "error":
+        return res.get("error", "Unknown error")
+    chains = res.get("result") or []
+    if not chains:
+        return f"No chains found in '{obj_name}'."
+    return f"Chains in '{obj_name}': " + ", ".join(chains)
+
+
+@mcp.tool()
+def list_ligands(
+    obj_name: Annotated[str, Field(description="Object to inspect for organic ligands.")],
+) -> str:
+    """
+    Lists the small-molecule (organic) ligand residue names in an object.
+
+    Call this before :func:`ligand_view`, :func:`pocket_view`, or
+    :func:`pharmacophore_view` when you don't already know the ligand's
+    3-letter residue name.
+    """
+    # We could use `iterate (...) and organic, stored.ligs.add(resn)` and then
+    # read `stored.ligs` back, but PyMOL doesn't have a built-in "send me a
+    # variable" command, so we'd need a side channel. Cheaper: ask PyMOL to
+    # dump the organic atoms as PDB text and parse the resn column.
+    fetch = send_request("get_pdbstr", args=[f"({obj_name}) and organic"])
+    if fetch.get("status") == "error":
+        return fetch.get("error", "Unknown error")
+    pdb = fetch.get("result") or ""
+    ligs: set[str] = set()
+    for line in pdb.splitlines():
+        if line.startswith(("HETATM", "ATOM  ")):
+            resn = line[17:20].strip()
+            if resn:
+                ligs.add(resn)
+    if not ligs:
+        return f"No organic ligands found in '{obj_name}'."
+    return f"Ligands in '{obj_name}': " + ", ".join(sorted(ligs))

@@ -1,0 +1,121 @@
+# Git-based sync jobs
+#
+# Each job describes an upstream repo + directory to import into this repo.
+# The workflow will:
+# - detect jobs to run
+# - for each job, find new upstream commits since last recorded commit
+# - re-apply them into this repo (directory-only) and commit
+#
+# Notes:
+# - `upstream_ref` can be a branch (e.g. "master") or a tag (e.g. "v0.9.0").
+# - `path` is the directory in the upstream repo to import.
+# - `dest` is the directory in THIS repo where the content lands.
+
+version = 1
+
+[[jobs]]
+name = "dpdisp-submit"
+enabled = true
+upstream_repo = "deepmodeling/dpdispatcher"
+upstream_ref = "master"
+path = "skills/dpdisp-submit"
+dest = "tools/dpdisp-submit"
+
+[[jobs]]
+name = "dpdata-cli"
+enabled = true
+upstream_repo = "deepmodeling/dpdata"
+upstream_ref = "master"
+path = "skills/dpdata-cli"
+dest = "tools/dpdata-cli"
+
+[[jobs]]
+name = "dpdata-driver"
+enabled = true
+upstream_repo = "deepmodeling/dpdata"
+upstream_ref = "master"
+path = "skills/dpdata-driver"
+dest = "tools/dpdata-driver"
+
+[[jobs]]
+name = "dpdata-minimizer"
+enabled = true
+upstream_repo = "deepmodeling/dpdata"
+upstream_ref = "master"
+path = "skills/dpdata-minimizer"
+dest = "tools/dpdata-minimizer"
+
+[[jobs]]
+name = "create-skill"
+enabled = true
+upstream_repo = "njzjz/create-skill-agent-skill"
+upstream_ref = "master"
+path = "skills/create-skill"
+dest = ".github/skills/create-skill"
+
+[[jobs]]
+name = "dpgen-simplify"
+enabled = true
+upstream_repo = "deepmodeling/dpgen"
+upstream_ref = "master"
+path = "skills/dpgen-simplify"
+dest = "machine-learning-potentials/dpgen-simplify"
+
+[[jobs]]
+name = "reacnetgenerator"
+enabled = true
+upstream_repo = "deepmodeling/reacnetgenerator"
+upstream_ref = "master"
+path = "skills/reacnetgenerator"
+dest = "analysis/reacnetgenerator"
+
+[[jobs]]
+name = "deepmd-finetune-dpa3"
+enabled = true
+upstream_repo = "deepmodeling/deepmd-kit"
+upstream_ref = "master"
+path = "skills/deepmd-finetune-dpa3"
+dest = "machine-learning-potentials/deepmd-finetune-dpa3"
+
+[[jobs]]
+name = "deepmd-python-inference"
+enabled = true
+upstream_repo = "deepmodeling/deepmd-kit"
+upstream_ref = "master"
+path = "skills/deepmd-python-inference"
+dest = "machine-learning-potentials/deepmd-python-inference"
+
+[[jobs]]
+name = "deepmd-train"
+enabled = true
+upstream_repo = "deepmodeling/deepmd-kit"
+upstream_ref = "master"
+path = "skills/deepmd-train"
+dest = "machine-learning-potentials/deepmd-train"
+
+[[jobs]]
+name = "lammps-deepmd"
+enabled = true
+upstream_repo = "deepmodeling/deepmd-kit"
+upstream_ref = "master"
+path = "skills/lammps-deepmd"
+dest = "molecular-dynamics/lammps-deepmd"
+
+# Sync only xTBloom skills that directly run or integrate calculations. Setup,
+# native API, zero-copy ML, QM/MM coupling-development, and maintainer workflows
+# stay in the upstream repository until this catalog expands its scope.
+[[jobs]]
+name = "xtbloom-integrate-ase-dpdata"
+enabled = true
+upstream_repo = "jinzhezenggroup/xtbloom"
+upstream_ref = "main"
+path = "skills/xtbloom-integrate-ase-dpdata"
+dest = "quantum-chemistry/xtbloom-integrate-ase-dpdata"
+
+[[jobs]]
+name = "xtbloom-run-python-inference"
+enabled = true
+upstream_repo = "jinzhezenggroup/xtbloom"
+upstream_ref = "main"
+path = "skills/xtbloom-run-python-inference"
+dest = "quantum-chemistry/xtbloom-run-python-inference"

@@ -1,0 +1,23 @@
+{
+  "depcheck": {
+    "ignores": [
+      "@types/*",
+      "pino-pretty",
+      "typescript",
+      "tsc-alias",
+      "@cyanheads/mcp-ts-core",
+      "@socketsecurity/bun-security-scanner",
+      "@biomejs/biome",
+      "depcheck",
+      "@vitest/coverage-istanbul",
+      "fast-check"
+    ],
+    "ignorePatterns": []
+  },
+  "outdated": {
+    "allowlist": []
+  },
+  "packaging": {
+    "pluginManifests": true
+  }
+}

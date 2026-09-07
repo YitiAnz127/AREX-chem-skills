@@ -1,0 +1,8 @@
+{
+  "mcpServers": {
+    "bio-mcp": {
+      "command": "bio-mcp",
+      "description": "BioMCP - 零配置直连43个生物数据库的MCP服务器"
+    }
+  }
+}

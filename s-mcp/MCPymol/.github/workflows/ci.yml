@@ -1,0 +1,123 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+# Cancel superseded runs on the same ref (saves CI minutes on rapid pushes).
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+
+jobs:
+  lockfile:
+    name: Lockfile in sync
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - uses: astral-sh/setup-uv@c771a70e6277c0a99b617c7a806ffedaca235ff9 # v9.0.0
+        with:
+          enable-cache: true
+      # Fails fast and unambiguously if uv.lock drifts from pyproject.toml,
+      # instead of the error hiding inside every Tests (pyX.Y) install step.
+      - name: uv.lock matches pyproject.toml
+        run: uv lock --locked
+
+  lint:
+    name: Lint (ruff)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - uses: astral-sh/setup-uv@c771a70e6277c0a99b617c7a806ffedaca235ff9 # v9.0.0
+        with:
+          enable-cache: true
+      - run: uv sync --locked --all-groups
+      - name: ruff check
+        run: uv run ruff check --output-format=github .
+      - name: ruff format
+        run: uv run ruff format --check --diff .
+
+  typecheck:
+    name: Type check (mypy)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - uses: astral-sh/setup-uv@c771a70e6277c0a99b617c7a806ffedaca235ff9 # v9.0.0
+        with:
+          enable-cache: true
+      # The print extra must be installed or trimesh resolves to Any under
+      # ignore_missing_imports, and mypy silently skips the mesh-repair code —
+      # the one place in the tree doing real work against a third-party API.
+      - run: uv sync --locked --all-groups --extra print
+      - run: uv run mypy
+
+  test:
+    name: Tests (py${{ matrix.python-version }})
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        python-version: ["3.10", "3.11", "3.12", "3.13"]
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - uses: astral-sh/setup-uv@c771a70e6277c0a99b617c7a806ffedaca235ff9 # v9.0.0
+        with:
+          enable-cache: true
+      - name: Set up Python ${{ matrix.python-version }}
+        run: uv python install ${{ matrix.python-version }}
+      # --locked fails if uv.lock is stale relative to pyproject.toml,
+      # catching dependency drift before it reaches a release.
+      - name: Install dependencies
+        run: uv sync --locked --all-groups
+      - name: Run pytest
+        run: >
+          uv run pytest tests/ -v
+          --cov=mcpymol --cov-report=term-missing --cov-report=xml
+
+  print-extra:
+    name: Print extra imports
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - uses: astral-sh/setup-uv@c771a70e6277c0a99b617c7a806ffedaca235ff9 # v9.0.0
+        with:
+          enable-cache: true
+      # The `print` extra pulls heavy native deps (pymeshlab, scipy). This
+      # job just proves that code path still imports — it is silent otherwise.
+      - name: Install with print extra
+        run: uv sync --locked --extra print
+      - name: Import print_export
+        run: uv run python -c "from mcpymol.server import print_export; print('print_export import OK')"
+
+  build:
+    name: Build & metadata check
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - uses: astral-sh/setup-uv@c771a70e6277c0a99b617c7a806ffedaca235ff9 # v9.0.0
+        with:
+          enable-cache: true
+      - name: Build sdist and wheel
+        run: uv build
+      - name: Validate package metadata
+        run: uv run --with twine twine check dist/*
+
+  security:
+    name: Dependency audit (advisory)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - uses: astral-sh/setup-uv@c771a70e6277c0a99b617c7a806ffedaca235ff9 # v9.0.0
+        with:
+          enable-cache: true
+      - run: uv sync --locked --all-groups
+      # Advisory: a CVE in a transitive dep should be visible but should not
+      # block unrelated PRs. Step-level continue-on-error keeps the check
+      # green; triage via the run log / Dependabot alerts.
+      - name: pip-audit
+        run: uv run --with pip-audit pip-audit
+        continue-on-error: true

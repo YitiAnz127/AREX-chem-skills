@@ -1,0 +1,22 @@
+remove_definitions(-DRDKIT_GRAPHMOL_BUILD)
+add_definitions(-DRDKIT_DEPROTECT_BUILD)
+rdkit_library(Deprotect
+              Deprotect.cpp
+              LINK_LIBRARIES ChemReactions 
+	      FilterCatalog Fingerprints DataStructs Depictor
+              FileParsers SubstructMatch ChemTransforms GraphMol)
+
+
+rdkit_headers(Deprotect.h
+              DEST GraphMol/Deprotect)
+
+if(RDK_BUILD_BOOST_PYTHON_WRAPPERS)
+  add_subdirectory(Wrap)
+endif()
+
+if(RDK_BUILD_NANOBIND_WRAPPERS)
+  add_subdirectory(nbWrap)
+endif()
+
+rdkit_catch_test(deprotectTest deprotectTest.cpp LINK_LIBRARIES Deprotect )
+

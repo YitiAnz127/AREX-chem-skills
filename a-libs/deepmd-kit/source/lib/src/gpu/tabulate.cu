@@ -1,0 +1,1875 @@
+#include <math.h>
+
+#if GOOGLE_CUDA
+#include <mutex>
+#include <unordered_map>
+#endif
+
+#include "device.h"
+#include "tabulate.h"
+
+#define MM 4
+#define KK 4
+#define TPB 256
+#if GOOGLE_CUDA
+#define WARP_SIZE 32
+#elif TENSORFLOW_USE_ROCM
+// See https://github.com/pytorch/pytorch/pull/64302
+#define WARP_SIZE warpSize  // = 64 or 32 (Defined in hip_runtime.h)
+#else
+#error "should not touch here"
+#endif
+#define FULL_MASK 0xffffffff
+
+#if GOOGLE_CUDA
+#define GPU_DYNAMIC_SHARED_MEM_DECL(TYPE, NAME) extern __shared__ TYPE NAME[]
+#elif TENSORFLOW_USE_ROCM
+#define GPU_DYNAMIC_SHARED_MEM_DECL(TYPE, NAME) HIP_DYNAMIC_SHARED(TYPE, NAME)
+#else
+#error "should not touch here"
+#endif
+
+// Copyright 2017 The TensorFlow Authors.
+// Licensed under the Apache License, Version 2.0
+template <typename T>
+__device__ T
+GpuShuffleSync(unsigned mask, T value, int src_lane, int width = warpSize) {
+#if GOOGLE_CUDA
+  return __shfl_sync(mask, value, src_lane, width);
+#elif TENSORFLOW_USE_ROCM
+  return __shfl(value, src_lane, width);
+#else
+#error "should not touch here"
+#endif
+}
+
+__device__ void GpuSyncThreads() {
+#if GOOGLE_CUDA
+  __syncwarp();
+#elif TENSORFLOW_USE_ROCM
+  //__syncwarp();->syncwrap
+  __syncthreads();
+#else
+#error "should not touch here"
+#endif
+}
+
+template <typename FPTYPE>
+__forceinline__ __device__ FPTYPE nextafter_device(const FPTYPE& from,
+                                                   const FPTYPE& to);
+
+template <>
+__forceinline__ __device__ float nextafter_device<float>(const float& from,
+                                                         const float& to) {
+  return nextafterf(from, to);
+}
+
+template <>
+__forceinline__ __device__ double nextafter_device<double>(const double& from,
+                                                           const double& to) {
+  return nextafter(from, to);
+}
+
+template <typename FPTYPE>
+__forceinline__ __device__ int locate_high_tail_xx(const FPTYPE& lower,
+                                                   const FPTYPE& upper,
+                                                   const FPTYPE& max,
+                                                   const FPTYPE& stride0,
+                                                   const FPTYPE& stride1) {
+  const FPTYPE boundary_xx = nextafter_device(max, lower);
+  const int first_stride = int((upper - lower) / stride0);
+  return first_stride + int((boundary_xx - upper) / stride1);
+}
+
+template <typename FPTYPE>
+__forceinline__ __device__ int locate_high_tail_xx_se_t(const FPTYPE& lower,
+                                                        const FPTYPE& upper,
+                                                        const FPTYPE& min,
+                                                        const FPTYPE& max,
+                                                        const FPTYPE& stride0,
+                                                        const FPTYPE& stride1) {
+  const FPTYPE boundary_xx = nextafter_device(max, min);
+  const int first_stride =
+      int((lower - min) / stride1) + int((upper - lower) / stride0);
+  return first_stride + int((boundary_xx - upper) / stride1);
+}
+
+template <typename FPTYPE>
+__forceinline__ __device__ void locate_xx_se_a(FPTYPE& xx,
+                                               int& table_idx,
+                                               const FPTYPE& lower,
+                                               const FPTYPE& upper,
+                                               const FPTYPE& max,
+                                               const FPTYPE& stride0,
+                                               const FPTYPE& stride1,
+                                               FPTYPE& extrapolate_delta) {
+  const FPTYPE orig_xx = xx;
+  extrapolate_delta = (FPTYPE)0.;
+  if (xx < lower) {
+    table_idx = 0;
+    xx = (FPTYPE)0.;
+    extrapolate_delta = orig_xx - lower;
+  } else if (xx < upper) {
+    table_idx = (int)((xx - lower) / stride0);
+    xx -= (table_idx * stride0 + lower);
+  } else if (xx < max) {
+    int first_stride = int((upper - lower) / stride0);
+    table_idx = first_stride + (int)((xx - upper) / stride1);
+    xx -= ((table_idx - first_stride) * stride1 + upper);
+  } else {
+    int first_stride = int((upper - lower) / stride0);
+    table_idx = locate_high_tail_xx(lower, upper, max, stride0, stride1);
+    xx = max - ((table_idx - first_stride) * stride1 + upper);
+    extrapolate_delta = orig_xx - max;
+  }
+}
+
+template <typename FPTYPE>
+__forceinline__ __device__ void locate_xx_se_t(FPTYPE& xx,
+                                               int& table_idx,
+                                               const FPTYPE& lower,
+                                               const FPTYPE& upper,
+                                               const FPTYPE& min,
+                                               const FPTYPE& max,
+                                               const FPTYPE& stride0,
+                                               const FPTYPE& stride1,
+                                               FPTYPE& extrapolate_delta) {
+  const FPTYPE orig_xx = xx;
+  extrapolate_delta = (FPTYPE)0.;
+  if (xx < min) {
+    table_idx = 0;
+    xx = (FPTYPE)0.;
+    extrapolate_delta = orig_xx - min;
+  } else if (xx < lower) {
+    table_idx = (int)((xx - min) / stride1);
+    xx -= (table_idx * stride1 + min);
+  } else if (xx < upper) {
+    int first_stride = int((lower - min) / stride1);
+    table_idx = first_stride + (int)((xx - lower) / stride0);
+    xx -= ((table_idx - first_stride) * stride0 + lower);
+  } else if (xx < max) {
+    int first_stride =
+        int((lower - min) / stride1) + int((upper - lower) / stride0);
+    table_idx = first_stride + (int)((xx - upper) / stride1);
+    xx -= ((table_idx - first_stride) * stride1 + upper);
+  } else {
+    int first_stride =
+        int((lower - min) / stride1) + int((upper - lower) / stride0);
+    table_idx =
+        locate_high_tail_xx_se_t(lower, upper, min, max, stride0, stride1);
+    xx = max - ((table_idx - first_stride) * stride1 + upper);
+    extrapolate_delta = orig_xx - max;
+  }
+}
+
+// same with locate_xx_se_t
+template <typename FPTYPE>
+__forceinline__ __device__ void locate_xx_se_t_tebd(FPTYPE& xx,
+                                                    int& table_idx,
+                                                    const FPTYPE& lower,
+                                                    const FPTYPE& upper,
+                                                    const FPTYPE& min,
+                                                    const FPTYPE& max,
+                                                    const FPTYPE& stride0,
+                                                    const FPTYPE& stride1,
+                                                    FPTYPE& extrapolate_delta) {
+  const FPTYPE orig_xx = xx;
+  extrapolate_delta = (FPTYPE)0.;
+  if (xx < min) {
+    table_idx = 0;
+    xx = (FPTYPE)0.;
+    extrapolate_delta = orig_xx - min;
+  } else if (xx < lower) {
+    table_idx = (int)((xx - min) / stride1);
+    xx -= (table_idx * stride1 + min);
+  } else if (xx < upper) {
+    int first_stride = int((lower - min) / stride1);
+    table_idx = first_stride + (int)((xx - lower) / stride0);
+    xx -= ((table_idx - first_stride) * stride0 + lower);
+  } else if (xx < max) {
+    int first_stride =
+        int((lower - min) / stride1) + int((upper - lower) / stride0);
+    table_idx = first_stride + (int)((xx - upper) / stride1);
+    xx -= ((table_idx - first_stride) * stride1 + upper);
+  } else {
+    int first_stride =
+        int((lower - min) / stride1) + int((upper - lower) / stride0);
+    table_idx =
+        locate_high_tail_xx_se_t(lower, upper, min, max, stride0, stride1);
+    xx = max - ((table_idx - first_stride) * stride1 + upper);
+    extrapolate_delta = orig_xx - max;
+  }
+}
+
+template <typename FPTYPE>
+__forceinline__ __device__ void locate_xx_se_r(FPTYPE& xx,
+                                               int& table_idx,
+                                               const FPTYPE& lower,
+                                               const FPTYPE& upper,
+                                               const FPTYPE& max,
+                                               const FPTYPE& stride0,
+                                               const FPTYPE& stride1,
+                                               FPTYPE& extrapolate_delta) {
+  const FPTYPE orig_xx = xx;
+  extrapolate_delta = (FPTYPE)0.;
+  if (xx < lower) {
+    table_idx = 0;
+    xx = (FPTYPE)0.;
+    extrapolate_delta = orig_xx - lower;
+  } else if (xx < upper) {
+    table_idx = (int)((xx - lower) / stride0);
+    xx -= (table_idx * stride0 + lower);
+  } else if (xx < max) {
+    int first_stride = int((upper - lower) / stride0);
+    table_idx = first_stride + (int)((xx - upper) / stride1);
+    xx -= ((table_idx - first_stride) * stride1 + upper);
+  } else {
+    int first_stride = int((upper - lower) / stride0);
+    table_idx = locate_high_tail_xx(lower, upper, max, stride0, stride1);
+    xx = max - ((table_idx - first_stride) * stride1 + upper);
+    extrapolate_delta = orig_xx - max;
+  }
+}
+
+template <typename FPTYPE>
+__forceinline__ __device__ void load_polynomial_params(
+    FPTYPE var[6],
+    const FPTYPE* table,
+    const int& table_idx,
+    const int& idx,
+    const int& last_layer_size) {
+  var[0] = table[table_idx * last_layer_size * 6 + idx * 6 + 0];
+  var[1] = table[table_idx * last_layer_size * 6 + idx * 6 + 1];
+  var[2] = table[table_idx * last_layer_size * 6 + idx * 6 + 2];
+  var[3] = table[table_idx * last_layer_size * 6 + idx * 6 + 3];
+  var[4] = table[table_idx * last_layer_size * 6 + idx * 6 + 4];
+  var[5] = table[table_idx * last_layer_size * 6 + idx * 6 + 5];
+}
+
+template <typename FPTYPE>
+__forceinline__ __device__ FPTYPE polynomial5(const FPTYPE var[6],
+                                              const FPTYPE& xx) {
+  return var[0] +
+         (var[1] +
+          (var[2] + (var[3] + (var[4] + var[5] * xx) * xx) * xx) * xx) *
+             xx;
+}
+
+template <typename FPTYPE>
+__forceinline__ __device__ FPTYPE polynomial5_grad(const FPTYPE var[6],
+                                                   const FPTYPE& xx) {
+  return var[1] + ((FPTYPE)2. * var[2] +
+                   ((FPTYPE)3. * var[3] +
+                    ((FPTYPE)4. * var[4] + (FPTYPE)5. * var[5] * xx) * xx) *
+                       xx) *
+                      xx;
+}
+
+template <typename FPTYPE>
+__forceinline__ __device__ FPTYPE extrapolated_polynomial5(
+    const FPTYPE var[6], const FPTYPE& xx, const FPTYPE& extrapolate_delta) {
+  const FPTYPE grad = polynomial5_grad(var, xx);
+  return polynomial5(var, xx) + grad * extrapolate_delta;
+}
+
+template <typename FPTYPE>
+__forceinline__ __device__ FPTYPE dot(FPTYPE ll[4], FPTYPE rr[4]) {
+  return ll[0] * rr[0] + ll[1] * rr[1] + ll[2] * rr[2] + ll[3] * rr[3];
+}
+
+template <typename FPTYPE>
+__forceinline__ __device__ void warp_reduce(FPTYPE& val) {
+  for (int offset = WARP_SIZE / 2; offset > 0; offset >>= 1) {
+#if GOOGLE_CUDA
+    val += __shfl_down_sync(FULL_MASK, val, offset);
+#elif TENSORFLOW_USE_ROCM
+    val += __shfl_down(val, offset);  // ########????
+#else
+#error "should not touch here"
+#endif
+  }
+}
+
+template <typename FPTYPE, int MTILE, int KTILE>
+__global__ void tabulate_fusion_se_a_fifth_order_polynomial(
+    FPTYPE* out,
+    const FPTYPE* table,
+    const FPTYPE* em_x,
+    const FPTYPE* em,
+    const FPTYPE* two_embed,
+    const FPTYPE lower,
+    const FPTYPE upper,
+    const FPTYPE max,
+    const FPTYPE stride0,
+    const FPTYPE stride1,
+    const int nnei,
+    const int last_layer_size,
+    const bool is_sorted) {
+  bool enable_se_atten = two_embed != nullptr;
+#if TENSORFLOW_USE_ROCM
+  GPU_DYNAMIC_SHARED_MEM_DECL(int, _data)
+#endif
+  const int_64 block_idx = blockIdx.x;  // nloc
+  const int thread_idx = threadIdx.x;   // last_layer_size
+  FPTYPE ago = GpuShuffleSync(0xffffffff, em_x[block_idx * nnei + nnei - 1], 0);
+  bool unloop = false;
+  int breakpoint = nnei - 1;
+#if GOOGLE_CUDA
+  FPTYPE sum[MTILE] = {(FPTYPE)0.};
+#elif TENSORFLOW_USE_ROCM
+  FPTYPE* iteratorC = (FPTYPE*)&_data[0];
+  for (int kk = 0; kk < MTILE; kk++) {
+    iteratorC[kk * last_layer_size + thread_idx] = (FPTYPE)0.;
+  }
+  __syncthreads();
+#else
+#error "should not touch here"
+#endif
+  int mark_table_idx = -1;
+  FPTYPE var[6];
+  for (int ii = 0; ii < nnei; ii++) {
+    FPTYPE xx = em_x[block_idx * nnei + ii];
+    const int em_base = block_idx * nnei * MTILE + ii * MTILE;
+    if (xx == ago && em[em_base + 1] == 0. && em[em_base + 2] == 0. &&
+        em[em_base + 3] == 0. && is_sorted) {
+      unloop = true;
+      breakpoint = ii;
+    }
+    int table_idx = 0;
+    FPTYPE extrapolate_delta = (FPTYPE)0.;
+    locate_xx_se_a(xx, table_idx, lower, upper, max, stride0, stride1,
+                   extrapolate_delta);
+    if (table_idx != mark_table_idx) {
+      load_polynomial_params(var, table, table_idx, thread_idx,
+                             last_layer_size);
+    }
+    FPTYPE res = extrapolated_polynomial5(var, xx, extrapolate_delta);
+    if (enable_se_atten) {
+      FPTYPE t = two_embed[block_idx * nnei * last_layer_size +
+                           ii * last_layer_size + thread_idx];
+      res = res * t + res;
+    }
+
+    for (int kk = 0; kk < MTILE; kk++) {
+#if GOOGLE_CUDA
+      sum[kk]
+#elif TENSORFLOW_USE_ROCM
+      iteratorC[kk * last_layer_size + thread_idx]
+#else
+#error "should not touch here"
+#endif
+          += (nnei - breakpoint) * em[em_base + kk] * res;
+    }
+    if (unloop) {
+      break;
+    }
+    mark_table_idx = table_idx;
+  }
+  for (int ii = 0; ii < MTILE; ii++) {
+    out[block_idx * MTILE * last_layer_size + ii * last_layer_size +
+        thread_idx] =
+#if GOOGLE_CUDA
+        sum[ii];
+#elif TENSORFLOW_USE_ROCM
+        iteratorC[ii * last_layer_size + thread_idx];
+#else
+#error "should not touch here"
+#endif
+  }
+}
+
+template <typename FPTYPE, int MTILE, int KTILE, bool CACHE_DY>
+__global__ void tabulate_fusion_se_a_grad_fifth_order_polynomial(
+    FPTYPE* dy_dem_x,
+    FPTYPE* dy_dem,
+    FPTYPE* dy_dtwo,
+    const FPTYPE* table,
+    const FPTYPE* em_x,
+    const FPTYPE* em,
+    const FPTYPE* two_embed,
+    const FPTYPE* dy,
+    const FPTYPE lower,
+    const FPTYPE upper,
+    const FPTYPE max,
+    const FPTYPE stride0,
+    const FPTYPE stride1,
+    const int nnei,
+    const int last_layer_size,
+    const bool is_sorted) {
+  bool enable_se_atten = two_embed != nullptr;
+  GPU_DYNAMIC_SHARED_MEM_DECL(int, _data);
+  const int_64 block_idx = blockIdx.x;  // nloc
+  const int thread_idx = threadIdx.x;   // KTILE * WARP_SIZE, usually 128 here~
+  int warp_idx = GpuShuffleSync(0xffffffff, threadIdx.x / WARP_SIZE, 0);
+  int lane_idx = threadIdx.x % WARP_SIZE;
+  __shared__ int breakpoint;
+  const FPTYPE* iteratorA = dy + block_idx * MTILE * last_layer_size;
+  if (CACHE_DY) {
+    FPTYPE* shared_dy = (FPTYPE*)&_data[0];
+    for (int ii = 0; ii < MTILE; ii++) {
+      for (int jj = thread_idx; jj < last_layer_size; jj += blockDim.x) {
+        shared_dy[ii * last_layer_size + jj] =
+            iteratorA[ii * last_layer_size + jj];
+      }
+    }
+    __syncthreads();
+    iteratorA = shared_dy;
+  }
+  // Sorted padding must be folded at the first sentinel for the whole atom,
+  // exactly as in the sequential CPU implementation. A warp-local search can
+  // select several later sentinels because neighbor indices are striped over
+  // KTILE warps, producing duplicate tail contributions and overlapping
+  // dy_dtwo writes.
+  if (thread_idx == 0) {
+    breakpoint = nnei;  // nnei means that no padding sentinel was found.
+    if (is_sorted) {
+      const FPTYPE ago = em_x[block_idx * nnei + nnei - 1];
+      for (int ii = 0; ii < nnei; ++ii) {
+        const int em_base = block_idx * nnei * MTILE + ii * MTILE;
+        if (ago == em_x[block_idx * nnei + ii] && em[em_base + 1] == 0. &&
+            em[em_base + 2] == 0. && em[em_base + 3] == 0.) {
+          breakpoint = ii;
+          break;
+        }
+      }
+    }
+  }
+  __syncthreads();
+
+  // Keep the tile loop uniform across the block. GpuSyncThreads is a warp
+  // barrier on CUDA but a block barrier on ROCm, so warp-specific early exits
+  // would deadlock HIP when the shared breakpoint falls inside a tile.
+  for (int tile = 0; tile < nnei && tile <= breakpoint; tile += KTILE) {
+    const int ii = tile + warp_idx;
+    const bool active = ii < nnei && ii <= breakpoint;
+    const int em_base = block_idx * nnei * MTILE + ii * MTILE;
+    FPTYPE Csub = (FPTYPE)0.;
+    FPTYPE sum[MTILE] = {(FPTYPE)0.};
+    if (active) {
+      const int repeat_count = ii == breakpoint ? nnei - breakpoint : 1;
+      FPTYPE xx = em_x[block_idx * nnei + ii];
+      int table_idx = 0;
+      FPTYPE reg_em[MTILE];
+      for (int kk = 0; kk < MTILE; ++kk) {
+        reg_em[kk] = em[em_base + kk];
+      }
+      FPTYPE extrapolate_delta = (FPTYPE)0.;
+      locate_xx_se_a(xx, table_idx, lower, upper, max, stride0, stride1,
+                     extrapolate_delta);
+
+      FPTYPE var[6];
+      for (int jj = lane_idx; jj < last_layer_size; jj += WARP_SIZE) {
+        load_polynomial_params(var, table, table_idx, jj, last_layer_size);
+        FPTYPE res_grad = polynomial5_grad(var, xx);
+        FPTYPE res = polynomial5(var, xx) + res_grad * extrapolate_delta;
+        FPTYPE oldres = res;
+        FPTYPE t;
+        if (enable_se_atten) {
+          t = two_embed[block_idx * nnei * last_layer_size +
+                        ii * last_layer_size + jj];
+          res = res * t + res;
+        }
+
+        for (int kk = 0; kk < MTILE; kk++) {
+          sum[kk] += repeat_count * iteratorA[kk * last_layer_size + jj] * res;
+        }
+        res = (FPTYPE)0.;
+        for (int kk = 0; kk < MTILE; ++kk) {
+          res += reg_em[kk] * iteratorA[kk * last_layer_size + jj];
+        }
+        Csub +=
+            repeat_count * res_grad * (enable_se_atten ? res * t + res : res);
+        if (enable_se_atten) {
+          // Forward folds the complete padding tail using only this first
+          // sentinel's two-embedding value. Its gradient therefore owns the
+          // full repeat count; later padding entries are independent of the
+          // folded output and keep the zero written before the launch.
+          dy_dtwo[block_idx * nnei * last_layer_size + ii * last_layer_size +
+                  jj] = repeat_count * oldres * res;
+        }
+      }
+    }
+    GpuSyncThreads();
+    if (active) {
+      for (int kk = 0; kk < MTILE; kk++) {
+        warp_reduce(sum[kk]);
+      }
+      warp_reduce(Csub);
+      if (lane_idx == 0) {
+        for (int kk = 0; kk < MTILE; kk++) {
+          dy_dem[em_base + kk] = sum[kk];
+        }
+        dy_dem_x[block_idx * nnei + ii] = Csub;
+      }
+    }
+  }
+}
+
+template <typename FPTYPE, int MTILE, int KTILE>
+__global__ void tabulate_fusion_se_a_grad_grad_fifth_order_polynomial(
+    FPTYPE* dz_dy,
+    const FPTYPE* table,
+    const FPTYPE* em_x,
+    const FPTYPE* em,
+    const FPTYPE* two_embed,
+    const FPTYPE* dz_dy_dem_x,
+    const FPTYPE* dz_dy_dem,
+    const FPTYPE* dz_dy_dtwo,
+    const FPTYPE lower,
+    const FPTYPE upper,
+    const FPTYPE max,
+    const FPTYPE stride0,
+    const FPTYPE stride1,
+    const int nnei,
+    const int last_layer_size,
+    const bool is_sorted) {
+  bool enable_se_atten = two_embed != nullptr;
+  GPU_DYNAMIC_SHARED_MEM_DECL(int, _data);
+  const int_64 block_idx = blockIdx.x;  // nloc
+  const int thread_idx = threadIdx.x;   // last_layer_size
+  FPTYPE ago = GpuShuffleSync(0xffffffff, em_x[block_idx * nnei + nnei - 1], 0);
+  bool unloop = false;
+  int breakpoint = nnei - 1;
+#if GOOGLE_CUDA
+  FPTYPE sum[MTILE] = {(FPTYPE)0.};
+#elif TENSORFLOW_USE_ROCM
+  FPTYPE* iteratorC = (FPTYPE*)&_data[0];
+  for (int kk = 0; kk < MTILE; kk++) {
+    iteratorC[kk * last_layer_size + thread_idx] = (FPTYPE)0.;
+  }
+  __syncthreads();
+#else
+#error "should not touch here"
+#endif
+
+  int mark_table_idx = -1;
+  FPTYPE var[6];
+  for (int ii = 0; ii < nnei; ii++) {
+    FPTYPE xx = em_x[block_idx * nnei + ii];
+    FPTYPE dz_xx = dz_dy_dem_x[block_idx * nnei + ii];
+    const int em_base = block_idx * nnei * MTILE + ii * MTILE;
+    if (xx == ago && em[em_base + 1] == 0. && em[em_base + 2] == 0. &&
+        em[em_base + 3] == 0. && is_sorted) {
+      unloop = true;
+      breakpoint = ii;
+    }
+    int table_idx = 0;
+    FPTYPE extrapolate_delta = (FPTYPE)0.;
+    locate_xx_se_a(xx, table_idx, lower, upper, max, stride0, stride1,
+                   extrapolate_delta);
+    if (table_idx != mark_table_idx) {
+      load_polynomial_params(var, table, table_idx, thread_idx,
+                             last_layer_size);
+    }
+
+    FPTYPE res_grad = polynomial5_grad(var, xx);
+    FPTYPE res = polynomial5(var, xx) + res_grad * extrapolate_delta;
+    FPTYPE two_grad = 0.;
+    if (enable_se_atten) {
+      FPTYPE t = two_embed[block_idx * nnei * last_layer_size +
+                           ii * last_layer_size + thread_idx];
+      // For sorted padding, only the first sentinel has a nonzero
+      // two-embedding gradient. The repeat factor below applies its full tail
+      // multiplicity to this cotangent.
+      two_grad = dz_dy_dtwo[block_idx * nnei * last_layer_size +
+                            ii * last_layer_size + thread_idx] *
+                 res;
+      res += res * t;
+      res_grad += res_grad * t;
+    }
+
+    /*
+     * `dz_dy`(or `iteratorC`) represents the derivative of the variable `out`
+     * in the function `tabulate_fusion_se_a_fifth_order_polynomial`.
+     *
+     * The expression `em[em_index] * res_grad * dz_xx + dz_dy_dem[em_index] *
+     * res` utilizes the product rule of derivatives: `(f * g)' = f' * g + f *
+     * g'`.
+     *
+     * This expression can be alternatively expressed as:
+     * `dz_dy_dem[em_index] * res + em[em_index] * (res_grad * dz_xx)`.
+     * Note that we can refer to `dz_dy_dem` as `em'`
+     *
+     * Therefore, we can rewrite this expression as: `em' * res + em * res'`,
+     * where `em'` is the derivative of `em` and `res'` is the derivative of
+     * `res`. Additionally, `res'` can be further represented as: `res_grad *
+     * dz_xx`.
+     *
+     * If `enable_se_atten` is true, `res` will be `res * t + res`, and `res'`
+     * will become `(res_grad * t + res_grad) * dz_xx`.
+     */
+    for (int kk = 0; kk < MTILE; kk++) {
+      int em_index = block_idx * nnei * MTILE + ii * MTILE + kk;
+#if GOOGLE_CUDA
+      sum[kk] +=
+#elif TENSORFLOW_USE_ROCM
+      iteratorC[kk * last_layer_size + thread_idx] +=
+#else
+#error "should not touch here"
+#endif
+          (nnei - breakpoint) * (em[em_index] * (res_grad * dz_xx + two_grad) +
+                                 dz_dy_dem[em_index] * res);
+    }
+    mark_table_idx = table_idx;
+    if (unloop) {
+      break;
+    }
+  }
+  for (int ii = 0; ii < MTILE; ii++) {
+    dz_dy[block_idx * MTILE * last_layer_size + ii * last_layer_size +
+          thread_idx] =
+#if GOOGLE_CUDA
+        sum[ii];
+#elif TENSORFLOW_USE_ROCM
+        iteratorC[ii * last_layer_size + thread_idx];
+#else
+#error "should not touch here"
+#endif
+  }
+}
+
+template <typename FPTYPE, int MTILE, int KTILE>
+__global__ void tabulate_fusion_se_t_fifth_order_polynomial(
+    FPTYPE* out,
+    const FPTYPE* table,
+    const FPTYPE* em_x,
+    const FPTYPE* em,
+    const FPTYPE lower,
+    const FPTYPE upper,
+    const FPTYPE max,
+    const FPTYPE stride0,
+    const FPTYPE stride1,
+    const int nnei_i,
+    const int nnei_j,
+    const int last_layer_size) {
+  const int_64 block_idx = blockIdx.x;  // nloc
+  const int thread_idx = threadIdx.x;   // last_layer_size
+
+  FPTYPE sum = (FPTYPE)0.;
+  for (int ii = 0; ii < nnei_i; ii++) {
+    FPTYPE var[6];
+    int mark_table_idx = -1;
+    for (int jj = 0; jj < nnei_j; jj++) {
+      FPTYPE xx = em_x[block_idx * nnei_i * nnei_j + ii * nnei_j + jj];
+      FPTYPE tmp = xx;
+      int table_idx = 0;
+      FPTYPE extrapolate_delta = (FPTYPE)0.;
+      locate_xx_se_t(xx, table_idx, lower, upper, -max, max, stride0, stride1,
+                     extrapolate_delta);
+      if (table_idx != mark_table_idx) {
+        load_polynomial_params(var, table, table_idx, thread_idx,
+                               last_layer_size);
+      }
+      FPTYPE res = extrapolated_polynomial5(var, xx, extrapolate_delta);
+
+      sum += tmp * res;
+      mark_table_idx = table_idx;
+    }
+  }
+  out[block_idx * last_layer_size + thread_idx] = sum;
+}
+
+template <typename FPTYPE, int MTILE, int KTILE>
+__global__ void tabulate_fusion_se_t_grad_fifth_order_polynomial(
+    FPTYPE* dy_dem_x,
+    FPTYPE* dy_dem,
+    const FPTYPE* table,
+    const FPTYPE* em_x,
+    const FPTYPE* em,
+    const FPTYPE* dy,
+    const FPTYPE lower,
+    const FPTYPE upper,
+    const FPTYPE max,
+    const FPTYPE stride0,
+    const FPTYPE stride1,
+    const int nnei_i,
+    const int nnei_j,
+    const int last_layer_size) {
+  GPU_DYNAMIC_SHARED_MEM_DECL(int, _data);
+  const int_64 block_idx = blockIdx.x;  // nloc
+  const int thread_idx = threadIdx.x;   // KTILE * WARP_SIZE, usually 128 here~
+  int warp_idx = GpuShuffleSync(0xffffffff, threadIdx.x / WARP_SIZE, 0);
+  int lane_idx = threadIdx.x % WARP_SIZE;
+  FPTYPE* iteratorA = (FPTYPE*)&_data[0];  // dy
+  for (int ii = thread_idx; ii < last_layer_size; ii += blockDim.x) {
+    iteratorA[ii] = dy[block_idx * last_layer_size + ii];
+  }
+  __syncthreads();
+
+  for (int ii = 0; ii < nnei_i; ii++) {
+    // GpuSyncThreads is block-wide on ROCm, so every wavefront must execute
+    // the same number of tile iterations even when the last tile is partial.
+    for (int tile = 0; tile < nnei_j; tile += KTILE) {
+      const int jj = tile + warp_idx;
+      const bool active = jj < nnei_j;
+      FPTYPE sum = (FPTYPE)0.;
+      FPTYPE Csub = (FPTYPE)0.;
+      if (active) {
+        FPTYPE xx = em_x[block_idx * nnei_i * nnei_j + ii * nnei_j + jj];
+        FPTYPE tmp = xx;
+        int table_idx = 0;
+        FPTYPE extrapolate_delta = (FPTYPE)0.;
+        locate_xx_se_t(xx, table_idx, lower, upper, -max, max, stride0, stride1,
+                       extrapolate_delta);
+        for (int kk = lane_idx; kk < last_layer_size; kk += WARP_SIZE) {
+          FPTYPE var[6];
+          load_polynomial_params(var, table, table_idx, kk, last_layer_size);
+          FPTYPE res_grad = polynomial5_grad(var, xx);
+          FPTYPE res = polynomial5(var, xx) + res_grad * extrapolate_delta;
+
+          sum += iteratorA[kk] * res;
+          Csub += iteratorA[kk] * tmp * res_grad;
+        }
+      }
+      GpuSyncThreads();
+      if (active) {
+        warp_reduce(sum);
+        warp_reduce(Csub);
+        if (lane_idx == 0) {
+          dy_dem[block_idx * nnei_i * nnei_j + ii * nnei_j + jj] = sum;
+          dy_dem_x[block_idx * nnei_i * nnei_j + ii * nnei_j + jj] = Csub;
+        }
+      }
+    }
+  }
+}
+
+template <typename FPTYPE, int MTILE, int KTILE>
+__global__ void tabulate_fusion_se_t_grad_grad_fifth_order_polynomial(
+    FPTYPE* dz_dy,
+    const FPTYPE* table,
+    const FPTYPE* em_x,
+    const FPTYPE* em,
+    const FPTYPE* dz_dy_dem_x,
+    const FPTYPE* dz_dy_dem,
+    const FPTYPE lower,
+    const FPTYPE upper,
+    const FPTYPE max,
+    const FPTYPE stride0,
+    const FPTYPE stride1,
+    const int nnei_i,
+    const int nnei_j,
+    const int last_layer_size) {
+  const int_64 block_idx = blockIdx.x;  // nloc
+  const int thread_idx = threadIdx.x;   // last_layer_size
+
+  FPTYPE sum = (FPTYPE)0.;
+  for (int ii = 0; ii < nnei_i; ii++) {
+    int mark_table_idx = -1;
+    // The cached table index and coefficients must have the same lifetime.
+    // Keeping var outside the neighbor loop makes a cache hit reuse initialized
+    // coefficients instead of a newly scoped, uninitialized local array.
+    FPTYPE var[6];
+    for (int jj = 0; jj < nnei_j; jj++) {
+      FPTYPE xx = em_x[block_idx * nnei_i * nnei_j + ii * nnei_j + jj];
+      FPTYPE tmp = xx;
+      FPTYPE dz_xx =
+          dz_dy_dem_x[block_idx * nnei_i * nnei_j + ii * nnei_j + jj];
+      FPTYPE dz_em = dz_dy_dem[block_idx * nnei_i * nnei_j + ii * nnei_j + jj];
+
+      int table_idx = 0;
+      FPTYPE extrapolate_delta = (FPTYPE)0.;
+      locate_xx_se_t(xx, table_idx, lower, upper, -max, max, stride0, stride1,
+                     extrapolate_delta);
+      if (table_idx != mark_table_idx) {
+        load_polynomial_params(var, table, table_idx, thread_idx,
+                               last_layer_size);
+      }
+      FPTYPE res_grad = polynomial5_grad(var, xx);
+      FPTYPE res = polynomial5(var, xx) + res_grad * extrapolate_delta;
+
+      sum += (tmp * res_grad * dz_xx + dz_em * res);
+      mark_table_idx = table_idx;
+    }
+  }
+  dz_dy[block_idx * last_layer_size + thread_idx] = sum;
+}
+
+// Apply Grid-Stride Loop
+template <typename FPTYPE, int MTILE, int KTILE>
+__global__ void tabulate_fusion_se_t_tebd_fifth_order_polynomial(
+    FPTYPE* out,
+    const FPTYPE* table,
+    const FPTYPE* em_x,
+    const FPTYPE* em,
+    const FPTYPE lower,
+    const FPTYPE upper,
+    const FPTYPE max,
+    const FPTYPE stride0,
+    const FPTYPE stride1,
+    const int nnei_i,
+    const int nnei_j,
+    const int last_layer_size,
+    const int_64 total_work) {
+  // NOT USED: em: (nfnl, nnei_i, nnei_j)
+  // em_x: (nfnl * nnei_i * nnei_j, 1) flat version of em
+  // total_work = nloc * nnei_i * nnei_j
+  // Grid-Stride Loop
+  for (int_64 i = (int_64)blockIdx.x * blockDim.x + threadIdx.x; i < total_work;
+       i += (int_64)gridDim.x * blockDim.x) {
+    // Decompose the 1D index 'i' to get atom and neighbor indices
+    const int_64 block_idx = i / (nnei_i * nnei_j);
+    const int_64 local_idx = i % (nnei_i * nnei_j);
+    const int_64 ii = local_idx / nnei_j;
+    const int_64 jj = local_idx % nnei_j;
+
+    // Read the input value xx for this specific neighbor pair.
+    FPTYPE xx = em_x[i];
+
+    // Determine the table index based on the value of xx.
+    int table_idx = 0;
+    FPTYPE extrapolate_delta = (FPTYPE)0.;
+    locate_xx_se_t_tebd(xx, table_idx, lower, upper, -max, max, stride0,
+                        stride1, extrapolate_delta);
+
+    // Serially loop through the 'last_layer_size' dimension to calculate all
+    // features.
+    for (int idx = 0; idx < last_layer_size; idx++) {
+      FPTYPE var[6];
+      load_polynomial_params(var, table, table_idx, idx, last_layer_size);
+      FPTYPE res = extrapolated_polynomial5(var, xx, extrapolate_delta);
+      // Calculate the unique 1D output index for the 4D tensor (block_idx, ii,
+      // jj, idx).
+      const int_64 out_idx =
+          (int_64)block_idx * nnei_i * nnei_j * last_layer_size +
+          (int_64)ii * nnei_j * last_layer_size + (int_64)jj * last_layer_size +
+          idx;
+      // Write the result to the global output memory.
+      out[out_idx] = res;
+    }
+  }
+}
+
+// Apply Grid-Stride Loop
+template <typename FPTYPE, int MTILE, int KTILE>
+__global__ void tabulate_fusion_se_t_tebd_grad_fifth_order_polynomial(
+    FPTYPE* dy_dem_x,
+    const FPTYPE* table,
+    const FPTYPE* em_x,
+    const FPTYPE* em,
+    const FPTYPE* dy,
+    const FPTYPE lower,
+    const FPTYPE upper,
+    const FPTYPE max,
+    const FPTYPE stride0,
+    const FPTYPE stride1,
+    const int nnei_i,
+    const int nnei_j,
+    const int last_layer_size,
+    const int_64 total_work) {
+  // total_work = nloc * nnei_i * nnei_j
+  // Grid-Stride Loop
+  for (int_64 i = (int_64)blockIdx.x * blockDim.x + threadIdx.x; i < total_work;
+       i += (int_64)gridDim.x * blockDim.x) {
+    // Decompose the 1D index 'i' to get atom and neighbor indices
+    const int_64 block_idx = i / (nnei_i * nnei_j);
+    const int_64 local_idx = i % (nnei_i * nnei_j);
+    const int ii = local_idx / nnei_j;
+    const int jj = local_idx % nnei_j;
+
+    // Determine the table index based on the value of xx.
+    FPTYPE xx = em_x[i];
+    int table_idx = 0;
+    FPTYPE extrapolate_delta = (FPTYPE)0.;
+    locate_xx_se_t_tebd(xx, table_idx, lower, upper, -max, max, stride0,
+                        stride1, extrapolate_delta);
+
+    // Accumulate the gradient contributions from all features.
+    FPTYPE grad_sum = 0.0;
+    for (int idx = 0; idx < last_layer_size; idx++) {
+      FPTYPE var[6];
+      load_polynomial_params(var, table, table_idx, idx, last_layer_size);
+
+      // Calculate the derivative of the polynomial with respect to xx.
+      FPTYPE dres_dxx = polynomial5_grad(var, xx);
+
+      // Read the incoming gradient from the previous layer.
+      const int_64 dy_idx =
+          (int_64)block_idx * nnei_i * nnei_j * last_layer_size +
+          (int_64)ii * nnei_j * last_layer_size + (int_64)jj * last_layer_size +
+          idx;
+      FPTYPE dy_val = dy[dy_idx];
+
+      // Apply the chain rule: dL/dxx = sum over idx [ (dL/d_res_mm) *
+      // (d_res_mm/dxx) ]
+      grad_sum += dy_val * dres_dxx;
+    }
+
+    // Write the final summed gradient to the output array.
+    dy_dem_x[i] = grad_sum;
+  }
+}
+
+// Apply Grid-Stride Loop
+template <typename FPTYPE, int MTILE, int KTILE>
+__global__ void tabulate_fusion_se_t_tebd_grad_grad_fifth_order_polynomial(
+    FPTYPE* dz_dy,
+    const FPTYPE* table,
+    const FPTYPE* em_x,
+    const FPTYPE* em,
+    const FPTYPE* dz_dy_dem_x,
+    const FPTYPE lower,
+    const FPTYPE upper,
+    const FPTYPE max,
+    const FPTYPE stride0,
+    const FPTYPE stride1,
+    const int nnei_i,
+    const int nnei_j,
+    const int last_layer_size,
+    const int_64 total_work) {
+  // total_work = nloc * nnei_i * nnei_j
+  // Grid-Stride Loop
+  for (int_64 i = (int_64)blockIdx.x * blockDim.x + threadIdx.x; i < total_work;
+       i += (int_64)gridDim.x * blockDim.x) {
+    // Decompose the 1D index 'i' to get atom and neighbor indices
+    const int_64 block_idx = i / (nnei_i * nnei_j);
+    const int_64 local_idx = i % (nnei_i * nnei_j);
+    const int ii = local_idx / nnei_j;
+    const int jj = local_idx % nnei_j;
+
+    FPTYPE xx = em_x[i];
+
+    // Read the incoming gradient for xx. This value is the same for all 'idx'
+    // features.
+    const FPTYPE dz_dy_dem_x_val = dz_dy_dem_x[i];
+
+    // Determine the table index based on the value of xx.
+    int table_idx = 0;
+    FPTYPE extrapolate_delta = (FPTYPE)0.;
+    locate_xx_se_t_tebd(xx, table_idx, lower, upper, -max, max, stride0,
+                        stride1, extrapolate_delta);
+
+    // Serially loop through the 'last_layer_size' dimension.
+    for (int idx = 0; idx < last_layer_size; idx++) {
+      FPTYPE var[6];
+      load_polynomial_params(var, table, table_idx, idx, last_layer_size);
+
+      // Calculate the derivative of the polynomial with respect to xx.
+      FPTYPE dres_dxx = polynomial5_grad(var, xx);
+
+      // Apply the chain rule: dz/dy_idx = (dz/dxx) * (dxx/dy_idx)
+      // which simplifies to dz_dy_dem_x_val * dres_dxx
+      FPTYPE out_grad = dz_dy_dem_x_val * dres_dxx;
+
+      // Calculate the unique 1D output index for the 4D tensor (block_idx, ii,
+      // jj, idx).
+      const int_64 out_idx =
+          (int_64)block_idx * nnei_i * nnei_j * last_layer_size +
+          (int_64)ii * nnei_j * last_layer_size + (int_64)jj * last_layer_size +
+          idx;
+      dz_dy[out_idx] = out_grad;
+    }
+  }
+}
+
+template <typename FPTYPE, int MTILE, int KTILE>
+__global__ void tabulate_fusion_se_r_fifth_order_polynomial(
+    FPTYPE* out,
+    const FPTYPE* table,
+    const FPTYPE* em,
+    const FPTYPE lower,
+    const FPTYPE upper,
+    const FPTYPE max,
+    const FPTYPE stride0,
+    const FPTYPE stride1,
+    const int nnei,
+    const int last_layer_size) {
+  const int_64 block_idx = blockIdx.x;  // nloc
+  const int thread_idx = threadIdx.x;   // last_layer_size
+
+  int mark_table_idx = -1;
+  FPTYPE var[6];
+  for (int ii = 0; ii < nnei; ii++) {
+    FPTYPE xx = em[block_idx * nnei + ii];
+    int table_idx = 0;
+    FPTYPE extrapolate_delta = (FPTYPE)0.;
+    locate_xx_se_r(xx, table_idx, lower, upper, max, stride0, stride1,
+                   extrapolate_delta);
+    if (table_idx != mark_table_idx) {
+      load_polynomial_params(var, table, table_idx, thread_idx,
+                             last_layer_size);
+    }
+    out[block_idx * nnei * last_layer_size + ii * last_layer_size +
+        thread_idx] = extrapolated_polynomial5(var, xx, extrapolate_delta);
+    mark_table_idx = table_idx;
+  }
+}
+
+template <typename FPTYPE, int MTILE, int KTILE>
+__global__ void tabulate_fusion_se_r_grad_fifth_order_polynomial(
+    FPTYPE* dy_dem,
+    const FPTYPE* table,
+    const FPTYPE* em,
+    const FPTYPE* dy,
+    const FPTYPE lower,
+    const FPTYPE upper,
+    const FPTYPE max,
+    const FPTYPE stride0,
+    const FPTYPE stride1,
+    const int nnei,
+    const int last_layer_size) {
+  const int_64 block_idx = blockIdx.x;  // nloc
+  const int thread_idx = threadIdx.x;   // KTILE * WARP_SIZE, usually 128 here~
+  int warp_idx = GpuShuffleSync(0xffffffff, thread_idx / WARP_SIZE, 0);
+  int lane_idx = thread_idx % WARP_SIZE;
+  __syncthreads();
+  // Keep all wavefronts on uniform control flow around the ROCm block barrier.
+  for (int tile = 0; tile < nnei; tile += KTILE) {
+    const int ii = tile + warp_idx;
+    const bool active = ii < nnei;
+    FPTYPE Csub = (FPTYPE)0.;
+    if (active) {
+      FPTYPE xx = em[block_idx * nnei + ii];
+      int table_idx = 0;
+      FPTYPE extrapolate_delta = (FPTYPE)0.;
+      locate_xx_se_r(xx, table_idx, lower, upper, max, stride0, stride1,
+                     extrapolate_delta);
+
+      FPTYPE var[6];
+      for (int jj = lane_idx; jj < last_layer_size; jj += WARP_SIZE) {
+        load_polynomial_params(var, table, table_idx, jj, last_layer_size);
+        Csub +=
+            polynomial5_grad(var, xx) *
+            dy[block_idx * nnei * last_layer_size + ii * last_layer_size + jj];
+      }
+    }
+    GpuSyncThreads();
+    if (active) {
+      warp_reduce(Csub);
+      if (lane_idx == 0) {
+        dy_dem[block_idx * nnei + ii] = Csub;
+      }
+    }
+  }
+}
+
+template <typename FPTYPE, int MTILE, int KTILE>
+__global__ void tabulate_fusion_se_r_grad_grad_fifth_order_polynomial(
+    FPTYPE* dz_dy,
+    const FPTYPE* table,
+    const FPTYPE* em,
+    const FPTYPE* dz_dy_dem,
+    const FPTYPE lower,
+    const FPTYPE upper,
+    const FPTYPE max,
+    const FPTYPE stride0,
+    const FPTYPE stride1,
+    const int nnei,
+    const int last_layer_size) {
+  const int_64 block_idx = blockIdx.x;  // nloc
+  const int thread_idx = threadIdx.x;   // last_layer_size
+
+#if TENSORFLOW_USE_ROCM
+  __syncthreads();
+#endif
+
+  int mark_table_idx = -1;
+  FPTYPE var[6];
+  for (int ii = 0; ii < nnei; ii++) {
+    FPTYPE xx = em[block_idx * nnei + ii];
+    int table_idx = 0;
+    FPTYPE extrapolate_delta = (FPTYPE)0.;
+    locate_xx_se_r(xx, table_idx, lower, upper, max, stride0, stride1,
+                   extrapolate_delta);
+    if (table_idx != mark_table_idx) {
+      load_polynomial_params(var, table, table_idx, thread_idx,
+                             last_layer_size);
+    }
+    FPTYPE res_grad = polynomial5_grad(var, xx);
+    mark_table_idx = table_idx;
+    dz_dy[block_idx * nnei * last_layer_size + ii * last_layer_size +
+          thread_idx] = dz_dy_dem[block_idx * nnei + ii] * res_grad;
+  }
+}
+
+template <typename FPTYPE, int MTILE>
+void launch_tabulate_fusion_se_a(FPTYPE* out,
+                                 const FPTYPE* table,
+                                 const FPTYPE* table_info,
+                                 const FPTYPE* em_x,
+                                 const FPTYPE* em,
+                                 const FPTYPE* two_embed,
+                                 const int nloc,
+                                 const int nnei,
+                                 const int last_layer_size,
+                                 const bool is_sorted) {
+  tabulate_fusion_se_a_fifth_order_polynomial<FPTYPE, MTILE, KK>
+#if GOOGLE_CUDA
+      <<<nloc, last_layer_size>>>
+#elif TENSORFLOW_USE_ROCM
+      <<<nloc, last_layer_size, sizeof(FPTYPE) * MTILE * last_layer_size>>>
+#else
+#error "should not touch here"
+#endif
+      (out, table, em_x, em, two_embed, table_info[0], table_info[1],
+       table_info[2], table_info[3], table_info[4], nnei, last_layer_size,
+       is_sorted);
+}
+
+#if GOOGLE_CUDA
+namespace {
+
+struct CudaSharedMemoryLimits {
+  size_t standard;
+  size_t opt_in;
+};
+
+CudaSharedMemoryLimits get_cuda_shared_memory_limits(const int device) {
+  static std::mutex cache_mutex;
+  static std::unordered_map<int, CudaSharedMemoryLimits> cache;
+  std::lock_guard<std::mutex> lock(cache_mutex);
+  const auto cached = cache.find(device);
+  if (cached != cache.end()) {
+    return cached->second;
+  }
+
+  cudaDeviceProp properties;
+  DPErrcheck(cudaGetDeviceProperties(&properties, device));
+  const CudaSharedMemoryLimits limits{
+      properties.sharedMemPerBlock,
+      properties.sharedMemPerBlockOptin,
+  };
+  cache.emplace(device, limits);
+  return limits;
+}
+
+}  // namespace
+#endif
+
+template <typename FPTYPE, int MTILE>
+void launch_tabulate_fusion_se_a_grad(FPTYPE* dy_dem_x,
+                                      FPTYPE* dy_dem,
+                                      FPTYPE* dy_dtwo,
+                                      const FPTYPE* table,
+                                      const FPTYPE* table_info,
+                                      const FPTYPE* em_x,
+                                      const FPTYPE* em,
+                                      const FPTYPE* two_embed,
+                                      const FPTYPE* dy,
+                                      const int nloc,
+                                      const int nnei,
+                                      const int last_layer_size,
+                                      const bool is_sorted) {
+#if GOOGLE_CUDA
+  const size_t shared_memory = sizeof(FPTYPE) * MTILE * last_layer_size;
+  int device = 0;
+  DPErrcheck(cudaGetDevice(&device));
+  const CudaSharedMemoryLimits limits = get_cuda_shared_memory_limits(device);
+  const size_t shared_memory_limit =
+      limits.standard > limits.opt_in ? limits.standard : limits.opt_in;
+  if (shared_memory <= shared_memory_limit) {
+    auto kernel =
+        tabulate_fusion_se_a_grad_fifth_order_polynomial<FPTYPE, MTILE, KK,
+                                                         true>;
+    if (shared_memory > limits.standard) {
+      DPErrcheck(cudaFuncSetAttribute(
+          kernel, cudaFuncAttributeMaxDynamicSharedMemorySize,
+          static_cast<int>(shared_memory)));
+    }
+    kernel<<<nloc, KK * WARP_SIZE, shared_memory>>>(
+        dy_dem_x, dy_dem, dy_dtwo, table, em_x, em, two_embed, dy,
+        table_info[0], table_info[1], table_info[2], table_info[3],
+        table_info[4], nnei, last_layer_size, is_sorted);
+  } else {
+    tabulate_fusion_se_a_grad_fifth_order_polynomial<FPTYPE, MTILE, KK, false>
+        <<<nloc, KK * WARP_SIZE>>>(dy_dem_x, dy_dem, dy_dtwo, table, em_x, em,
+                                   two_embed, dy, table_info[0], table_info[1],
+                                   table_info[2], table_info[3], table_info[4],
+                                   nnei, last_layer_size, is_sorted);
+  }
+#elif TENSORFLOW_USE_ROCM
+  tabulate_fusion_se_a_grad_fifth_order_polynomial<FPTYPE, MTILE, KK, true>
+      <<<nloc, KK * WARP_SIZE, sizeof(FPTYPE) * MTILE * last_layer_size>>>(
+          dy_dem_x, dy_dem, dy_dtwo, table, em_x, em, two_embed, dy,
+          table_info[0], table_info[1], table_info[2], table_info[3],
+          table_info[4], nnei, last_layer_size, is_sorted);
+#else
+#error "should not touch here"
+#endif
+}
+
+template <typename FPTYPE, int MTILE>
+void launch_tabulate_fusion_se_a_grad_grad(FPTYPE* dz_dy,
+                                           const FPTYPE* table,
+                                           const FPTYPE* table_info,
+                                           const FPTYPE* em_x,
+                                           const FPTYPE* em,
+                                           const FPTYPE* two_embed,
+                                           const FPTYPE* dz_dy_dem_x,
+                                           const FPTYPE* dz_dy_dem,
+                                           const FPTYPE* dz_dy_dtwo,
+                                           const int nloc,
+                                           const int nnei,
+                                           const int last_layer_size,
+                                           const bool is_sorted) {
+  tabulate_fusion_se_a_grad_grad_fifth_order_polynomial<FPTYPE, MTILE, KK>
+#if GOOGLE_CUDA
+      <<<nloc, last_layer_size>>>(
+#elif TENSORFLOW_USE_ROCM
+      <<<nloc, last_layer_size, sizeof(FPTYPE) * MTILE * last_layer_size>>>(
+#else
+#error "should not touch here"
+#endif
+          dz_dy, table, em_x, em, two_embed, dz_dy_dem_x, dz_dy_dem, dz_dy_dtwo,
+          table_info[0], table_info[1], table_info[2], table_info[3],
+          table_info[4], nnei, last_layer_size, is_sorted);
+}
+
+namespace deepmd {
+template <typename FPTYPE>
+void tabulate_fusion_se_a_gpu(FPTYPE* out,
+                              const FPTYPE* table,
+                              const FPTYPE* table_info,
+                              const FPTYPE* em_x,
+                              const FPTYPE* em,
+                              const FPTYPE* two_embed,
+                              const int nloc,
+                              const int nnei,
+                              const int last_layer_size,
+                              const bool is_sorted,
+                              const int ndescrpt) {
+  detail::check_se_a_basis_dimension(ndescrpt);
+  if (nloc <= 0) {
+    return;
+  }
+  DPErrcheck(gpuGetLastError());
+  DPErrcheck(gpuDeviceSynchronize());
+  if (nnei <= 0) {
+    // The descriptor does not carry the empty neighbor dimension, so its
+    // mathematically empty reduction must be materialized explicitly.
+    DPErrcheck(
+        gpuMemset(out, 0, sizeof(FPTYPE) * nloc * ndescrpt * last_layer_size));
+    DPErrcheck(gpuDeviceSynchronize());
+    return;
+  }
+  if (ndescrpt == 4) {
+    launch_tabulate_fusion_se_a<FPTYPE, 4>(out, table, table_info, em_x, em,
+                                           two_embed, nloc, nnei,
+                                           last_layer_size, is_sorted);
+  } else if (ndescrpt == 9) {
+    launch_tabulate_fusion_se_a<FPTYPE, 9>(out, table, table_info, em_x, em,
+                                           two_embed, nloc, nnei,
+                                           last_layer_size, is_sorted);
+  } else if (ndescrpt == 16) {
+    launch_tabulate_fusion_se_a<FPTYPE, 16>(out, table, table_info, em_x, em,
+                                            two_embed, nloc, nnei,
+                                            last_layer_size, is_sorted);
+  } else {
+    launch_tabulate_fusion_se_a<FPTYPE, 25>(out, table, table_info, em_x, em,
+                                            two_embed, nloc, nnei,
+                                            last_layer_size, is_sorted);
+  }
+  DPErrcheck(gpuGetLastError());
+  DPErrcheck(gpuDeviceSynchronize());
+}
+
+template <typename FPTYPE>
+void tabulate_fusion_se_a_grad_gpu(FPTYPE* dy_dem_x,
+                                   FPTYPE* dy_dem,
+                                   FPTYPE* dy_dtwo,
+                                   const FPTYPE* table,
+                                   const FPTYPE* table_info,
+                                   const FPTYPE* em_x,
+                                   const FPTYPE* em,
+                                   const FPTYPE* two_embed,
+                                   const FPTYPE* dy,
+                                   const int nloc,
+                                   const int nnei,
+                                   const int last_layer_size,
+                                   const bool is_sorted,
+                                   const int ndescrpt) {
+  detail::check_se_a_basis_dimension(ndescrpt);
+  if (nloc <= 0 || nnei <= 0) {
+    return;
+  }
+  DPErrcheck(gpuGetLastError());
+  DPErrcheck(gpuDeviceSynchronize());
+  DPErrcheck(gpuMemset(dy_dem_x, 0, sizeof(FPTYPE) * nloc * nnei));
+  DPErrcheck(gpuMemset(dy_dem, 0, sizeof(FPTYPE) * nloc * nnei * ndescrpt));
+  if (two_embed != nullptr && is_sorted) {
+    // The sorted-padding fast path writes only the first sentinel. Explicitly
+    // clear the unused tail because framework output buffers are uninitialized.
+    DPErrcheck(
+        gpuMemset(dy_dtwo, 0, sizeof(FPTYPE) * nloc * nnei * last_layer_size));
+  }
+
+  if (ndescrpt == 4) {
+    launch_tabulate_fusion_se_a_grad<FPTYPE, 4>(
+        dy_dem_x, dy_dem, dy_dtwo, table, table_info, em_x, em, two_embed, dy,
+        nloc, nnei, last_layer_size, is_sorted);
+  } else if (ndescrpt == 9) {
+    launch_tabulate_fusion_se_a_grad<FPTYPE, 9>(
+        dy_dem_x, dy_dem, dy_dtwo, table, table_info, em_x, em, two_embed, dy,
+        nloc, nnei, last_layer_size, is_sorted);
+  } else if (ndescrpt == 16) {
+    launch_tabulate_fusion_se_a_grad<FPTYPE, 16>(
+        dy_dem_x, dy_dem, dy_dtwo, table, table_info, em_x, em, two_embed, dy,
+        nloc, nnei, last_layer_size, is_sorted);
+  } else {
+    launch_tabulate_fusion_se_a_grad<FPTYPE, 25>(
+        dy_dem_x, dy_dem, dy_dtwo, table, table_info, em_x, em, two_embed, dy,
+        nloc, nnei, last_layer_size, is_sorted);
+  }
+  DPErrcheck(gpuGetLastError());
+  DPErrcheck(gpuDeviceSynchronize());
+}
+
+template <typename FPTYPE>
+void tabulate_fusion_se_a_grad_grad_gpu(FPTYPE* dz_dy,
+                                        const FPTYPE* table,
+                                        const FPTYPE* table_info,
+                                        const FPTYPE* em_x,
+                                        const FPTYPE* em,
+                                        const FPTYPE* two_embed,
+                                        const FPTYPE* dz_dy_dem_x,
+                                        const FPTYPE* dz_dy_dem,
+                                        const FPTYPE* dz_dy_dtwo,
+                                        const int nloc,
+                                        const int nnei,
+                                        const int last_layer_size,
+                                        const bool is_sorted,
+                                        const int ndescrpt) {
+  detail::check_se_a_basis_dimension(ndescrpt);
+  if (nloc <= 0) {
+    return;
+  }
+  DPErrcheck(gpuGetLastError());
+  DPErrcheck(gpuDeviceSynchronize());
+  if (nnei <= 0) {
+    // Unlike the neighbor-shaped inputs, dz_dy remains non-empty and must be
+    // initialized to the zero second derivative of an empty reduction.
+    DPErrcheck(gpuMemset(dz_dy, 0,
+                         sizeof(FPTYPE) * nloc * ndescrpt * last_layer_size));
+    DPErrcheck(gpuDeviceSynchronize());
+    return;
+  }
+  DPErrcheck(
+      gpuMemset(dz_dy, 0, sizeof(FPTYPE) * nloc * ndescrpt * last_layer_size));
+  if (ndescrpt == 4) {
+    launch_tabulate_fusion_se_a_grad_grad<FPTYPE, 4>(
+        dz_dy, table, table_info, em_x, em, two_embed, dz_dy_dem_x, dz_dy_dem,
+        dz_dy_dtwo, nloc, nnei, last_layer_size, is_sorted);
+  } else if (ndescrpt == 9) {
+    launch_tabulate_fusion_se_a_grad_grad<FPTYPE, 9>(
+        dz_dy, table, table_info, em_x, em, two_embed, dz_dy_dem_x, dz_dy_dem,
+        dz_dy_dtwo, nloc, nnei, last_layer_size, is_sorted);
+  } else if (ndescrpt == 16) {
+    launch_tabulate_fusion_se_a_grad_grad<FPTYPE, 16>(
+        dz_dy, table, table_info, em_x, em, two_embed, dz_dy_dem_x, dz_dy_dem,
+        dz_dy_dtwo, nloc, nnei, last_layer_size, is_sorted);
+  } else {
+    launch_tabulate_fusion_se_a_grad_grad<FPTYPE, 25>(
+        dz_dy, table, table_info, em_x, em, two_embed, dz_dy_dem_x, dz_dy_dem,
+        dz_dy_dtwo, nloc, nnei, last_layer_size, is_sorted);
+  }
+  DPErrcheck(gpuGetLastError());
+  DPErrcheck(gpuDeviceSynchronize());
+}
+
+template <typename FPTYPE>
+void tabulate_fusion_se_t_gpu(FPTYPE* out,
+                              const FPTYPE* table,
+                              const FPTYPE* table_info,
+                              const FPTYPE* em_x,
+                              const FPTYPE* em,
+                              const int nloc,
+                              const int nnei_i,
+                              const int nnei_j,
+                              const int last_layer_size) {
+  if (nloc <= 0) {
+    return;
+  }
+  DPErrcheck(gpuGetLastError());
+  DPErrcheck(gpuDeviceSynchronize());
+  tabulate_fusion_se_t_fifth_order_polynomial<FPTYPE, MM, KK>
+      <<<nloc, last_layer_size>>>(
+          out, table, em_x, em, table_info[0], table_info[1], table_info[2],
+          table_info[3], table_info[4], nnei_i, nnei_j, last_layer_size);
+  DPErrcheck(gpuGetLastError());
+  DPErrcheck(gpuDeviceSynchronize());
+}
+
+template <typename FPTYPE>
+void tabulate_fusion_se_t_grad_gpu(FPTYPE* dy_dem_x,
+                                   FPTYPE* dy_dem,
+                                   const FPTYPE* table,
+                                   const FPTYPE* table_info,
+                                   const FPTYPE* em_x,
+                                   const FPTYPE* em,
+                                   const FPTYPE* dy,
+                                   const int nloc,
+                                   const int nnei_i,
+                                   const int nnei_j,
+                                   const int last_layer_size) {
+  if (nloc <= 0) {
+    return;
+  }
+  DPErrcheck(gpuGetLastError());
+  DPErrcheck(gpuDeviceSynchronize());
+  DPErrcheck(gpuMemset(dy_dem_x, 0, sizeof(FPTYPE) * nloc * nnei_i * nnei_j));
+  DPErrcheck(gpuMemset(dy_dem, 0, sizeof(FPTYPE) * nloc * nnei_i * nnei_j));
+
+  tabulate_fusion_se_t_grad_fifth_order_polynomial<FPTYPE, MM, KK>
+      <<<nloc, KK * WARP_SIZE, sizeof(FPTYPE) * last_layer_size>>>(
+          dy_dem_x, dy_dem, table, em_x, em, dy, table_info[0], table_info[1],
+          table_info[2], table_info[3], table_info[4], nnei_i, nnei_j,
+          last_layer_size);
+  DPErrcheck(gpuGetLastError());
+  DPErrcheck(gpuDeviceSynchronize());
+}
+
+template <typename FPTYPE>
+void tabulate_fusion_se_t_grad_grad_gpu(FPTYPE* dz_dy,
+                                        const FPTYPE* table,
+                                        const FPTYPE* table_info,
+                                        const FPTYPE* em_x,
+                                        const FPTYPE* em,
+                                        const FPTYPE* dz_dy_dem_x,
+                                        const FPTYPE* dz_dy_dem,
+                                        const int nloc,
+                                        const int nnei_i,
+                                        const int nnei_j,
+                                        const int last_layer_size) {
+  if (nloc <= 0) {
+    return;
+  }
+  DPErrcheck(gpuGetLastError());
+  DPErrcheck(gpuDeviceSynchronize());
+  DPErrcheck(gpuMemset(dz_dy, 0, sizeof(FPTYPE) * nloc * last_layer_size));
+
+  tabulate_fusion_se_t_grad_grad_fifth_order_polynomial<FPTYPE, MM, KK>
+      <<<nloc, last_layer_size>>>(dz_dy, table, em_x, em, dz_dy_dem_x,
+                                  dz_dy_dem, table_info[0], table_info[1],
+                                  table_info[2], table_info[3], table_info[4],
+                                  nnei_i, nnei_j, last_layer_size);
+  DPErrcheck(gpuGetLastError());
+  DPErrcheck(gpuDeviceSynchronize());
+}
+
+// SE_T_TEBD kernels - preserve full nt_i x nt_j structure unlike SE_T
+template <typename FPTYPE>
+void tabulate_fusion_se_t_tebd_gpu(FPTYPE* out,
+                                   const FPTYPE* table,
+                                   const FPTYPE* table_info,
+                                   const FPTYPE* em_x,
+                                   const FPTYPE* em,
+                                   const int nloc,
+                                   const int nnei_i,
+                                   const int nnei_j,
+                                   const int last_layer_size) {
+  if (nloc <= 0 || nnei_i <= 0 || nnei_j <= 0) {
+    return;
+  }
+  const int_64 total_work = (int_64)nloc * nnei_i * nnei_j;
+  // Use fixed number of threads per block
+  const int num_threads = TPB;
+  // Calculate number of blocks needed
+  const int num_blocks = (total_work + num_threads - 1) / num_threads;
+
+  DPErrcheck(gpuGetLastError());
+  DPErrcheck(gpuDeviceSynchronize());
+  tabulate_fusion_se_t_tebd_fifth_order_polynomial<FPTYPE, MM, KK>
+      <<<num_blocks, num_threads>>>(out, table, em_x, em, table_info[0],
+                                    table_info[1], table_info[2], table_info[3],
+                                    table_info[4], nnei_i, nnei_j,
+                                    last_layer_size, total_work);
+  DPErrcheck(gpuGetLastError());
+  DPErrcheck(gpuDeviceSynchronize());
+}
+
+template <typename FPTYPE>
+void tabulate_fusion_se_t_tebd_grad_gpu(FPTYPE* dy_dem_x,
+                                        const FPTYPE* table,
+                                        const FPTYPE* table_info,
+                                        const FPTYPE* em_x,
+                                        const FPTYPE* em,
+                                        const FPTYPE* dy,
+                                        const int nloc,
+                                        const int nnei_i,
+                                        const int nnei_j,
+                                        const int last_layer_size) {
+  if (nloc <= 0 || nnei_i <= 0 || nnei_j <= 0) {
+    return;
+  }
+  const int_64 total_work = (int_64)nloc * nnei_i * nnei_j;
+  const int num_threads = TPB;
+  const int num_blocks = (total_work + num_threads - 1) / num_threads;
+
+  DPErrcheck(gpuGetLastError());
+  DPErrcheck(gpuDeviceSynchronize());
+  DPErrcheck(gpuMemset(dy_dem_x, 0, sizeof(FPTYPE) * total_work));
+  tabulate_fusion_se_t_tebd_grad_fifth_order_polynomial<FPTYPE, MM, KK>
+      <<<num_blocks, num_threads>>>(dy_dem_x, table, em_x, em, dy,
+                                    table_info[0], table_info[1], table_info[2],
+                                    table_info[3], table_info[4], nnei_i,
+                                    nnei_j, last_layer_size, total_work);
+  DPErrcheck(gpuGetLastError());
+  DPErrcheck(gpuDeviceSynchronize());
+}
+
+template <typename FPTYPE>
+void tabulate_fusion_se_t_tebd_grad_grad_gpu(FPTYPE* dz_dy,
+                                             const FPTYPE* table,
+                                             const FPTYPE* table_info,
+                                             const FPTYPE* em_x,
+                                             const FPTYPE* em,
+                                             const FPTYPE* dz_dy_dem_x,
+                                             const int nloc,
+                                             const int nnei_i,
+                                             const int nnei_j,
+                                             const int last_layer_size) {
+  if (nloc <= 0 || nnei_i <= 0 || nnei_j <= 0) {
+    return;
+  }
+  const int_64 total_work = (int_64)nloc * nnei_i * nnei_j;
+  const int num_threads = TPB;
+  const int num_blocks = (total_work + num_threads - 1) / num_threads;
+
+  DPErrcheck(gpuGetLastError());
+  DPErrcheck(gpuDeviceSynchronize());
+  DPErrcheck(
+      gpuMemset(dz_dy, 0, sizeof(FPTYPE) * total_work * last_layer_size));
+
+  tabulate_fusion_se_t_tebd_grad_grad_fifth_order_polynomial<FPTYPE, MM, KK>
+      <<<num_blocks, num_threads>>>(dz_dy, table, em_x, em, dz_dy_dem_x,
+                                    table_info[0], table_info[1], table_info[2],
+                                    table_info[3], table_info[4], nnei_i,
+                                    nnei_j, last_layer_size, total_work);
+  DPErrcheck(gpuGetLastError());
+  DPErrcheck(gpuDeviceSynchronize());
+}
+
+template <typename FPTYPE>
+void tabulate_fusion_se_r_gpu(FPTYPE* out,
+                              const FPTYPE* table,
+                              const FPTYPE* table_info,
+                              const FPTYPE* em,
+                              const int nloc,
+                              const int nnei,
+                              const int last_layer_size) {
+  if (nloc <= 0) {
+    return;
+  }
+  DPErrcheck(gpuGetLastError());
+  DPErrcheck(gpuDeviceSynchronize());
+  tabulate_fusion_se_r_fifth_order_polynomial<FPTYPE, MM, KK>
+      <<<nloc, last_layer_size>>>(out, table, em, table_info[0], table_info[1],
+                                  table_info[2], table_info[3], table_info[4],
+                                  nnei, last_layer_size);
+  DPErrcheck(gpuGetLastError());
+  DPErrcheck(gpuDeviceSynchronize());
+}
+
+template <typename FPTYPE>
+void tabulate_fusion_se_r_grad_gpu(FPTYPE* dy_dem,
+                                   const FPTYPE* table,
+                                   const FPTYPE* table_info,
+                                   const FPTYPE* em,
+                                   const FPTYPE* dy,
+                                   const int nloc,
+                                   const int nnei,
+                                   const int last_layer_size) {
+  if (nloc <= 0) {
+    return;
+  }
+  DPErrcheck(gpuGetLastError());
+  DPErrcheck(gpuDeviceSynchronize());
+  DPErrcheck(gpuMemset(dy_dem, 0, sizeof(FPTYPE) * nloc * nnei));
+
+  tabulate_fusion_se_r_grad_fifth_order_polynomial<FPTYPE, MM, KK>
+      <<<nloc, KK * WARP_SIZE, sizeof(FPTYPE) * MM * last_layer_size>>>(
+          dy_dem, table, em, dy, table_info[0], table_info[1], table_info[2],
+          table_info[3], table_info[4], nnei, last_layer_size);
+  DPErrcheck(gpuGetLastError());
+  DPErrcheck(gpuDeviceSynchronize());
+}
+
+template <typename FPTYPE>
+void tabulate_fusion_se_r_grad_grad_gpu(FPTYPE* dz_dy,
+                                        const FPTYPE* table,
+                                        const FPTYPE* table_info,
+                                        const FPTYPE* em,
+                                        const FPTYPE* dz_dy_dem,
+                                        const int nloc,
+                                        const int nnei,
+                                        const int last_layer_size) {
+  if (nloc <= 0) {
+    return;
+  }
+  DPErrcheck(gpuGetLastError());
+  DPErrcheck(gpuDeviceSynchronize());
+  DPErrcheck(
+      gpuMemset(dz_dy, 0, sizeof(FPTYPE) * nloc * nnei * last_layer_size));
+  tabulate_fusion_se_r_grad_grad_fifth_order_polynomial<FPTYPE, MM, KK>
+      <<<nloc, last_layer_size, sizeof(FPTYPE) * MM * last_layer_size>>>(
+          dz_dy, table, em, dz_dy_dem, table_info[0], table_info[1],
+          table_info[2], table_info[3], table_info[4], nnei, last_layer_size);
+  DPErrcheck(gpuGetLastError());
+  DPErrcheck(gpuDeviceSynchronize());
+}
+
+template void tabulate_fusion_se_a_gpu<float>(float* out,
+                                              const float* table,
+                                              const float* table_info,
+                                              const float* em_x,
+                                              const float* em,
+                                              const float* two_embed,
+                                              const int nloc,
+                                              const int nnei,
+                                              const int last_layer_size,
+                                              const bool is_sorted,
+                                              const int ndescrpt);
+template void tabulate_fusion_se_a_gpu<double>(double* out,
+                                               const double* table,
+                                               const double* table_info,
+                                               const double* em_x,
+                                               const double* em,
+                                               const double* two_embed,
+                                               const int nloc,
+                                               const int nnei,
+                                               const int last_layer_size,
+                                               const bool is_sorted,
+                                               const int ndescrpt);
+template void tabulate_fusion_se_a_grad_gpu<float>(float* dy_dem_x,
+                                                   float* dy_dem,
+                                                   float* dy_dtwo,
+                                                   const float* table,
+                                                   const float* table_info,
+                                                   const float* em_x,
+                                                   const float* em,
+                                                   const float* two_embed,
+                                                   const float* dy,
+                                                   const int nloc,
+                                                   const int nnei,
+                                                   const int last_layer_size,
+                                                   const bool is_sorted,
+                                                   const int ndescrpt);
+template void tabulate_fusion_se_a_grad_gpu<double>(double* dy_dem_x,
+                                                    double* dy_dem,
+                                                    double* dy_dtwo,
+                                                    const double* table,
+                                                    const double* table_info,
+                                                    const double* em_x,
+                                                    const double* em,
+                                                    const double* two_embed,
+                                                    const double* dy,
+                                                    const int nloc,
+                                                    const int nnei,
+                                                    const int last_layer_size,
+                                                    const bool is_sorted,
+                                                    const int ndescrpt);
+template void tabulate_fusion_se_a_grad_grad_gpu<float>(
+    float* dz_dy,
+    const float* table,
+    const float* table_info,
+    const float* em_x,
+    const float* em,
+    const float* two_embed,
+    const float* dz_dy_dem_x,
+    const float* dz_dy_dem,
+    const float* dz_dy_dtwo,
+    const int nloc,
+    const int nnei,
+    const int last_layer_size,
+    const bool is_sorted,
+    const int ndescrpt);
+template void tabulate_fusion_se_a_grad_grad_gpu<double>(
+    double* dz_dy,
+    const double* table,
+    const double* table_info,
+    const double* em_x,
+    const double* em,
+    const double* two_embed,
+    const double* dz_dy_dem_x,
+    const double* dz_dy_dem,
+    const double* dz_dy_dtwo,
+    const int nloc,
+    const int nnei,
+    const int last_layer_size,
+    const bool is_sorted,
+    const int ndescrpt);
+
+template void tabulate_fusion_se_t_gpu<float>(float* out,
+                                              const float* table,
+                                              const float* table_info,
+                                              const float* em_x,
+                                              const float* em,
+                                              const int nloc,
+                                              const int nnei_i,
+                                              const int nnei_j,
+                                              const int last_layer_size);
+template void tabulate_fusion_se_t_gpu<double>(double* out,
+                                               const double* table,
+                                               const double* table_info,
+                                               const double* em_x,
+                                               const double* em,
+                                               const int nloc,
+                                               const int nnei_i,
+                                               const int nnei_j,
+                                               const int last_layer_size);
+template void tabulate_fusion_se_t_grad_gpu<float>(float* dy_dem_x,
+                                                   float* dy_dem,
+                                                   const float* table,
+                                                   const float* table_info,
+                                                   const float* em_x,
+                                                   const float* em,
+                                                   const float* dy,
+                                                   const int nloc,
+                                                   const int nnei_i,
+                                                   const int nnei_j,
+                                                   const int last_layer_size);
+template void tabulate_fusion_se_t_grad_gpu<double>(double* dy_dem_x,
+                                                    double* dy_dem,
+                                                    const double* table,
+                                                    const double* table_info,
+                                                    const double* em_x,
+                                                    const double* em,
+                                                    const double* dy,
+                                                    const int nloc,
+                                                    const int nnei_i,
+                                                    const int nnei_j,
+                                                    const int last_layer_size);
+template void tabulate_fusion_se_t_grad_grad_gpu<float>(
+    float* dz_dy,
+    const float* table,
+    const float* table_info,
+    const float* em_x,
+    const float* em,
+    const float* dz_dy_dem_x,
+    const float* dz_dy_dem,
+    const int nloc,
+    const int nnei_i,
+    const int nnei_j,
+    const int last_layer_size);
+template void tabulate_fusion_se_t_grad_grad_gpu<double>(
+    double* dz_dy,
+    const double* table,
+    const double* table_info,
+    const double* em_x,
+    const double* em,
+    const double* dz_dy_dem_x,
+    const double* dz_dy_dem,
+    const int nloc,
+    const int nnei_i,
+    const int nnei_j,
+    const int last_layer_size);
+
+template void tabulate_fusion_se_r_gpu<float>(float* out,
+                                              const float* table,
+                                              const float* table_info,
+                                              const float* em,
+                                              const int nloc,
+                                              const int nnei,
+                                              const int last_layer_size);
+template void tabulate_fusion_se_r_gpu<double>(double* out,
+                                               const double* table,
+                                               const double* table_info,
+                                               const double* em,
+                                               const int nloc,
+                                               const int nnei,
+                                               const int last_layer_size);
+template void tabulate_fusion_se_r_grad_gpu<float>(float* dy_dem,
+                                                   const float* table,
+                                                   const float* table_info,
+                                                   const float* em,
+                                                   const float* dy,
+                                                   const int nloc,
+                                                   const int nnei,
+                                                   const int last_layer_size);
+template void tabulate_fusion_se_r_grad_gpu<double>(double* dy_dem,
+                                                    const double* table,
+                                                    const double* table_info,
+                                                    const double* em,
+                                                    const double* dy,
+                                                    const int nloc,
+                                                    const int nnei,
+                                                    const int last_layer_size);
+template void tabulate_fusion_se_r_grad_grad_gpu<float>(
+    float* dz_dy,
+    const float* table,
+    const float* table_info,
+    const float* em,
+    const float* dz_dy_dem,
+    const int nloc,
+    const int nnei,
+    const int last_layer_size);
+template void tabulate_fusion_se_r_grad_grad_gpu<double>(
+    double* dz_dy,
+    const double* table,
+    const double* table_info,
+    const double* em,
+    const double* dz_dy_dem,
+    const int nloc,
+    const int nnei,
+    const int last_layer_size);
+
+// Template instantiations for SE_T_TEBD GPU functions
+template void tabulate_fusion_se_t_tebd_gpu<float>(float* out,
+                                                   const float* table,
+                                                   const float* table_info,
+                                                   const float* em_x,
+                                                   const float* em,
+                                                   const int nloc,
+                                                   const int nnei_i,
+                                                   const int nnei_j,
+                                                   const int last_layer_size);
+
+template void tabulate_fusion_se_t_tebd_gpu<double>(double* out,
+                                                    const double* table,
+                                                    const double* table_info,
+                                                    const double* em_x,
+                                                    const double* em,
+                                                    const int nloc,
+                                                    const int nnei_i,
+                                                    const int nnei_j,
+                                                    const int last_layer_size);
+
+template void tabulate_fusion_se_t_tebd_grad_gpu<float>(
+    float* dy_dem_x,
+    const float* table,
+    const float* table_info,
+    const float* em_x,
+    const float* em,
+    const float* dy,
+    const int nloc,
+    const int nnei_i,
+    const int nnei_j,
+    const int last_layer_size);
+
+template void tabulate_fusion_se_t_tebd_grad_gpu<double>(
+    double* dy_dem_x,
+    const double* table,
+    const double* table_info,
+    const double* em_x,
+    const double* em,
+    const double* dy,
+    const int nloc,
+    const int nnei_i,
+    const int nnei_j,
+    const int last_layer_size);
+
+template void tabulate_fusion_se_t_tebd_grad_grad_gpu<float>(
+    float* dz_dy,
+    const float* table,
+    const float* table_info,
+    const float* em_x,
+    const float* em,
+    const float* dz_dy_dem_x,
+    const int nloc,
+    const int nnei_i,
+    const int nnei_j,
+    const int last_layer_size);
+
+template void tabulate_fusion_se_t_tebd_grad_grad_gpu<double>(
+    double* dz_dy,
+    const double* table,
+    const double* table_info,
+    const double* em_x,
+    const double* em,
+    const double* dz_dy_dem_x,
+    const int nloc,
+    const int nnei_i,
+    const int nnei_j,
+    const int last_layer_size);
+
+}  // namespace deepmd

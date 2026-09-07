@@ -1,0 +1,19 @@
+# GAFF2 case metadata for the 42-38 PRISM-FEP example
+case:
+  group: hif2a
+  name: 42-38
+  path: hif2a/42-38
+fundamental:
+  ref: 42
+  mut: 38
+  rec: receptor.pdb
+system:
+model:
+  no_solvate: false
+  charge_mode: mode2
+  distance: 12
+simulation:
+  numofsteps: 510000
+  repeats: 4
+other:
+  verbose: true

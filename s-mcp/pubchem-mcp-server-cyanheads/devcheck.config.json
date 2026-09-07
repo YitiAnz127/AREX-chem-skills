@@ -1,0 +1,19 @@
+{
+  "depcheck": {
+    "ignores": [
+      "@types/*",
+      "pino-pretty",
+      "typescript",
+      "tsc-alias",
+      "depcheck",
+      "@socketsecurity/bun-security-scanner"
+    ],
+    "ignorePatterns": []
+  },
+  "outdated": {
+    "allowlist": []
+  },
+  "packaging": {
+    "pluginManifests": true
+  }
+}

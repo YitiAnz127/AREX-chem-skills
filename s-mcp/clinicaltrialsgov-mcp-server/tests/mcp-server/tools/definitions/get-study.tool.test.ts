@@ -1,0 +1,1380 @@
+/**
+ * @fileoverview Tests for clinicaltrials_get_study_record tool.
+ * @module tests/mcp-server/tools/definitions/get-study.tool
+ */
+
+import { createMockContext } from '@cyanheads/mcp-ts-core/testing';
+import { beforeEach, describe, expect, it, vi } from 'vitest';
+
+const { mockGetService } = vi.hoisted(() => ({
+  mockGetService: vi.fn(),
+}));
+
+vi.mock('@/services/clinical-trials/clinical-trials-service.js', () => ({
+  getClinicalTrialsService: mockGetService,
+}));
+
+import { getStudy } from '@/mcp-server/tools/definitions/get-study.tool.js';
+import { loadStudyFixture, missingLeaves } from '../../../helpers/format-parity.js';
+
+describe('getStudy', () => {
+  const mockService = { getStudy: vi.fn() };
+
+  beforeEach(() => {
+    vi.clearAllMocks();
+    mockGetService.mockReturnValue(mockService as never);
+  });
+
+  describe('input validation', () => {
+    it('accepts valid NCT ID', () => {
+      expect(() => getStudy.input!.parse({ nctId: 'NCT12345678' })).not.toThrow();
+    });
+
+    it('rejects invalid NCT ID format', () => {
+      expect(() => getStudy.input!.parse({ nctId: 'INVALID' })).toThrow();
+      expect(() => getStudy.input!.parse({ nctId: 'NCT1234' })).toThrow();
+      expect(() => getStudy.input!.parse({ nctId: 'nct12345678' })).toThrow();
+    });
+
+    it('rejects missing nctId', () => {
+      expect(() => getStudy.input!.parse({})).toThrow();
+    });
+  });
+
+  describe('handler', () => {
+    it('returns study for valid nctId', async () => {
+      const study = {
+        protocolSection: { identificationModule: { nctId: 'NCT12345678', briefTitle: 'Test' } },
+      };
+      mockService.getStudy.mockResolvedValue(study);
+
+      const ctx = createMockContext({ errors: getStudy.errors });
+      const result = await getStudy.handler(getStudy.input!.parse({ nctId: 'NCT12345678' }), ctx);
+
+      expect(result.study).toStrictEqual(study);
+      expect(mockService.getStudy).toHaveBeenCalledWith('NCT12345678', ctx);
+    });
+
+    it('propagates service errors', async () => {
+      mockService.getStudy.mockRejectedValue(new Error('Not found'));
+      const ctx = createMockContext({ errors: getStudy.errors });
+      await expect(
+        getStudy.handler(getStudy.input!.parse({ nctId: 'NCT12345678' }), ctx),
+      ).rejects.toThrow('Not found');
+    });
+
+    it('omits the heavy resultsSection and returns compact resultsSummary counts (#63)', async () => {
+      const study = {
+        hasResults: true,
+        protocolSection: {
+          identificationModule: { nctId: 'NCT02130466', briefTitle: 'Results Study' },
+        },
+        resultsSection: {
+          outcomeMeasuresModule: { outcomeMeasures: [{ title: 'A' }, { title: 'B' }] },
+          adverseEventsModule: {
+            seriousEvents: Array.from({ length: 87 }, (_, i) => ({ term: `S${i}` })),
+            otherEvents: Array.from({ length: 328 }, (_, i) => ({ term: `O${i}` })),
+          },
+          participantFlowModule: { periods: [{ title: 'Overall' }] },
+          baselineCharacteristicsModule: { measures: [{ title: 'Age' }] },
+        },
+      };
+      mockService.getStudy.mockResolvedValue(study);
+
+      const ctx = createMockContext({ errors: getStudy.errors });
+      const result = await getStudy.handler(getStudy.input!.parse({ nctId: 'NCT02130466' }), ctx);
+
+      // The full resultsSection must not ride along in structuredContent.
+      expect((result.study as { resultsSection?: unknown }).resultsSection).toBeUndefined();
+      expect(result.resultsSummary).toEqual({
+        outcomeMeasures: 2,
+        seriousAdverseEvents: 87,
+        otherAdverseEvents: 328,
+        participantFlowPeriods: 1,
+        baselineMeasures: 1,
+      });
+    });
+
+    it('omits resultsSummary when the study has no posted results (#63)', async () => {
+      mockService.getStudy.mockResolvedValue({
+        hasResults: false,
+        protocolSection: {
+          identificationModule: { nctId: 'NCT12345678', briefTitle: 'No Results' },
+        },
+      });
+
+      const ctx = createMockContext({ errors: getStudy.errors });
+      const result = await getStudy.handler(getStudy.input!.parse({ nctId: 'NCT12345678' }), ctx);
+      expect(result.resultsSummary).toBeUndefined();
+    });
+  });
+
+  describe('filter parity — structuredContent and format() carry the same data (#46)', () => {
+    const buildStudy = (overrides: Record<string, unknown> = {}) => ({
+      protocolSection: {
+        identificationModule: { nctId: 'NCT12345678', briefTitle: 'X' },
+        ...overrides,
+      },
+    });
+
+    const getStructuredLocations = (result: { study: Record<string, unknown> }) => {
+      const ps = (
+        result.study as {
+          protocolSection?: { contactsLocationsModule?: { locations?: unknown[] } };
+        }
+      ).protocolSection;
+      return ps?.contactsLocationsModule?.locations ?? [];
+    };
+
+    const getStructuredSecondary = (result: { study: Record<string, unknown> }) => {
+      const ps = (
+        result.study as { protocolSection?: { outcomesModule?: { secondaryOutcomes?: unknown[] } } }
+      ).protocolSection;
+      return ps?.outcomesModule?.secondaryOutcomes ?? [];
+    };
+
+    it('locationLimit caps locations in both surfaces and records the upstream total', async () => {
+      const locations = Array.from({ length: 30 }, (_, i) => ({
+        facility: `Hospital ${i}`,
+        country: 'US',
+      }));
+      mockService.getStudy.mockResolvedValue(
+        buildStudy({ contactsLocationsModule: { locations } }),
+      );
+
+      const ctx = createMockContext({ errors: getStudy.errors });
+      const result = await getStudy.handler(
+        getStudy.input!.parse({ nctId: 'NCT12345678', locationLimit: 5 }),
+        ctx,
+      );
+
+      expect(getStructuredLocations(result)).toHaveLength(5);
+      expect(result.filtersApplied.totalLocations).toBe(30);
+      expect(result.filtersApplied.locationLimit).toBe(5);
+
+      const text = (getStudy.format!(result)[0] as { text: string }).text;
+      expect(text).toContain('## Locations (5 of 30 total)');
+      for (let i = 0; i < 5; i++) expect(text).toContain(`Hospital ${i}`);
+      expect(text).not.toContain('Hospital 5,');
+      expect(text).not.toContain('Hospital 29');
+    });
+
+    it('locationLimit omitted (default) leaves the full list intact in both surfaces', async () => {
+      const locations = Array.from({ length: 30 }, (_, i) => ({
+        facility: `Hospital ${i}`,
+        country: 'US',
+      }));
+      mockService.getStudy.mockResolvedValue(
+        buildStudy({ contactsLocationsModule: { locations } }),
+      );
+
+      const ctx = createMockContext({ errors: getStudy.errors });
+      const result = await getStudy.handler(getStudy.input!.parse({ nctId: 'NCT12345678' }), ctx);
+
+      expect(getStructuredLocations(result)).toHaveLength(30);
+
+      const text = (getStudy.format!(result)[0] as { text: string }).text;
+      expect(text).toContain('## Locations (30 total)');
+      for (let i = 0; i < 30; i++) expect(text).toContain(`Hospital ${i}`);
+    });
+
+    it('outcomeLimit caps secondary and other outcomes in both surfaces', async () => {
+      const secondaryOutcomes = Array.from({ length: 20 }, (_, i) => ({
+        measure: `Secondary ${i}`,
+      }));
+      const otherOutcomes = Array.from({ length: 8 }, (_, i) => ({
+        measure: `Other ${i}`,
+      }));
+      mockService.getStudy.mockResolvedValue(
+        buildStudy({ outcomesModule: { secondaryOutcomes, otherOutcomes } }),
+      );
+
+      const ctx = createMockContext({ errors: getStudy.errors });
+      const result = await getStudy.handler(
+        getStudy.input!.parse({ nctId: 'NCT12345678', outcomeLimit: 3 }),
+        ctx,
+      );
+
+      expect(getStructuredSecondary(result)).toHaveLength(3);
+      expect(result.filtersApplied.totalSecondaryOutcomes).toBe(20);
+      expect(result.filtersApplied.totalOtherOutcomes).toBe(8);
+
+      const text = (getStudy.format!(result)[0] as { text: string }).text;
+      expect(text).toContain('## Secondary Outcomes (3 of 20)');
+      expect(text).toContain('## Other Outcomes (3 of 8)');
+      expect(text).toContain('Secondary 2');
+      expect(text).not.toContain('Secondary 3');
+    });
+
+    it('nearLocation filters by radius, sorts by distance, and annotates distanceMi in both surfaces', async () => {
+      mockService.getStudy.mockResolvedValue(
+        buildStudy({
+          contactsLocationsModule: {
+            locations: [
+              {
+                facility: 'Boston General',
+                country: 'US',
+                geoPoint: { lat: 42.3601, lon: -71.0589 },
+              },
+              {
+                facility: 'Portland Clinic',
+                country: 'US',
+                geoPoint: { lat: 45.5152, lon: -122.6784 },
+              },
+              {
+                facility: 'Seattle Med',
+                country: 'US',
+                geoPoint: { lat: 47.6062, lon: -122.3321 },
+              },
+            ],
+          },
+        }),
+      );
+
+      const ctx = createMockContext({ errors: getStudy.errors });
+      const result = await getStudy.handler(
+        getStudy.input!.parse({
+          nctId: 'NCT12345678',
+          nearLocation: { lat: 47.6062, lon: -122.3321, radiusMi: 250 },
+        }),
+        ctx,
+      );
+
+      const locs = getStructuredLocations(result) as Array<{
+        facility: string;
+        distanceMi?: number;
+      }>;
+      expect(locs.map((l) => l.facility)).toEqual(['Seattle Med', 'Portland Clinic']);
+      expect(locs[0]?.distanceMi).toBeCloseTo(0, 0);
+      expect(locs[1]?.distanceMi).toBeGreaterThan(100);
+      expect(result.filtersApplied.totalLocations).toBe(3);
+
+      const text = (getStudy.format!(result)[0] as { text: string }).text;
+      expect(text).toContain('within 250 mi');
+      expect(text).toContain('of 3 total');
+      expect(text).toContain('Seattle Med');
+      expect(text).toContain('Portland Clinic');
+      expect(text).not.toContain('Boston General');
+      expect(text.indexOf('Seattle Med')).toBeLessThan(text.indexOf('Portland Clinic'));
+      expect(text).toMatch(/Seattle Med.*\(0\.0 mi\)/);
+    });
+
+    it('nearLocation drops locations without coordinates and records the count', async () => {
+      mockService.getStudy.mockResolvedValue(
+        buildStudy({
+          contactsLocationsModule: {
+            locations: [
+              { facility: 'Has Coords', geoPoint: { lat: 47.6062, lon: -122.3321 } },
+              { facility: 'No Coords' },
+              { facility: 'Also No Coords' },
+            ],
+          },
+        }),
+      );
+
+      const ctx = createMockContext({ errors: getStudy.errors });
+      const result = await getStudy.handler(
+        getStudy.input!.parse({
+          nctId: 'NCT12345678',
+          nearLocation: { lat: 47.6062, lon: -122.3321, radiusMi: 50 },
+        }),
+        ctx,
+      );
+
+      expect(getStructuredLocations(result)).toHaveLength(1);
+      expect(result.filtersApplied.locationsWithoutGeo).toBe(2);
+
+      const text = (getStudy.format!(result)[0] as { text: string }).text;
+      expect(text).toContain('Has Coords');
+      expect(text).toContain('2 without coordinates skipped');
+      expect(text).not.toContain('No Coords,');
+    });
+
+    it('nearLocation matching zero sites renders the header with the zero count and reason (#96)', async () => {
+      mockService.getStudy.mockResolvedValue(
+        buildStudy({
+          contactsLocationsModule: {
+            locations: [{ facility: 'Saint Louis Site', geoPoint: { lat: 38.627, lon: -90.1994 } }],
+          },
+        }),
+      );
+
+      const ctx = createMockContext({ errors: getStudy.errors });
+      const result = await getStudy.handler(
+        getStudy.input!.parse({
+          nctId: 'NCT12345678',
+          nearLocation: { lat: -33.8688, lon: 151.2093, radiusMi: 10 },
+        }),
+        ctx,
+      );
+
+      expect(getStructuredLocations(result)).toHaveLength(0);
+      expect(result.filtersApplied.totalLocations).toBe(1);
+
+      const text = (getStudy.format!(result)[0] as { text: string }).text;
+      expect(text).toContain('## Locations (0 within 10 mi of -33.869,151.209 of 1 total)');
+      expect(text).toContain('No sites within the requested radius.');
+      expect(text).toContain('omit nearLocation to see all 1 site');
+    });
+
+    it('nearLocation with every site lacking coordinates names the coordinate gap as the reason (#96)', async () => {
+      mockService.getStudy.mockResolvedValue(
+        buildStudy({
+          contactsLocationsModule: {
+            locations: [{ facility: 'No Coords A' }, { facility: 'No Coords B' }],
+          },
+        }),
+      );
+
+      const ctx = createMockContext({ errors: getStudy.errors });
+      const result = await getStudy.handler(
+        getStudy.input!.parse({
+          nctId: 'NCT12345678',
+          nearLocation: { lat: 47.6062, lon: -122.3321, radiusMi: 50 },
+        }),
+        ctx,
+      );
+
+      expect(getStructuredLocations(result)).toHaveLength(0);
+      expect(result.filtersApplied.locationsWithoutGeo).toBe(2);
+      expect(result.filtersApplied.totalLocations).toBe(2);
+
+      const text = (getStudy.format!(result)[0] as { text: string }).text;
+      expect(text).toContain('## Locations (0 within 50 mi of 47.606,-122.332 of 2 total');
+      expect(text).toContain('2 without coordinates skipped)');
+      expect(text).toContain('all 2 published sites lack coordinates');
+      // The far-away wording would be the wrong diagnosis here.
+      expect(text).not.toContain('No sites within the requested radius.');
+    });
+
+    it('nearLocation combined with locationLimit matching zero sites still renders the header (#96)', async () => {
+      mockService.getStudy.mockResolvedValue(
+        buildStudy({
+          contactsLocationsModule: {
+            locations: [
+              { facility: 'Far A', geoPoint: { lat: 42.3601, lon: -71.0589 } },
+              { facility: 'Far B', geoPoint: { lat: 45.5152, lon: -122.6784 } },
+            ],
+          },
+        }),
+      );
+
+      const ctx = createMockContext({ errors: getStudy.errors });
+      const result = await getStudy.handler(
+        getStudy.input!.parse({
+          nctId: 'NCT12345678',
+          nearLocation: { lat: -33.8688, lon: 151.2093, radiusMi: 25 },
+          locationLimit: 3,
+        }),
+        ctx,
+      );
+
+      expect(getStructuredLocations(result)).toHaveLength(0);
+
+      const text = (getStudy.format!(result)[0] as { text: string }).text;
+      expect(text).toContain('## Locations (0 within 25 mi of -33.869,151.209 of 2 total)');
+      expect(text).toContain('omit nearLocation to see all 2 sites');
+    });
+
+    it('a study that publishes no sites renders no Locations section even with nearLocation (#96)', async () => {
+      mockService.getStudy.mockResolvedValue(buildStudy({ contactsLocationsModule: {} }));
+
+      const ctx = createMockContext({ errors: getStudy.errors });
+      const result = await getStudy.handler(
+        getStudy.input!.parse({
+          nctId: 'NCT12345678',
+          nearLocation: { lat: 47.6062, lon: -122.3321, radiusMi: 50 },
+        }),
+        ctx,
+      );
+
+      // No upstream sites means no filter ran, so nothing is echoed and the
+      // section stays silent — "no sites published" is not "none nearby" (#96).
+      expect(result.filtersApplied).toEqual({});
+
+      const text = (getStudy.format!(result)[0] as { text: string }).text;
+      expect(text).not.toContain('## Locations');
+    });
+
+    it('referenceLimit caps references in both surfaces and records the upstream total (#73)', async () => {
+      const references = Array.from({ length: 19 }, (_, i) => ({
+        pmid: `${20000 + i}`,
+        citation: `Reference ${i}.`,
+      }));
+      mockService.getStudy.mockResolvedValue(buildStudy({ referencesModule: { references } }));
+
+      const ctx = createMockContext({ errors: getStudy.errors });
+      const result = await getStudy.handler(
+        getStudy.input!.parse({ nctId: 'NCT12345678', referenceLimit: 5 }),
+        ctx,
+      );
+
+      const ps = (
+        result.study as {
+          protocolSection?: { referencesModule?: { references?: unknown[] } };
+        }
+      ).protocolSection;
+      expect(ps?.referencesModule?.references).toHaveLength(5);
+      expect(result.filtersApplied.totalReferences).toBe(19);
+      expect(result.filtersApplied.referenceLimit).toBe(5);
+
+      const text = (getStudy.format!(result)[0] as { text: string }).text;
+      expect(text).toContain('## References (5 of 19)');
+      for (let i = 0; i < 5; i++) expect(text).toContain(`Reference ${i}.`);
+      expect(text).not.toContain('Reference 5.');
+      expect(text).not.toContain('Reference 18.');
+      expect(text).toContain('referenceLimit=5');
+      expect(text).toContain('totalReferences=19');
+    });
+
+    it('referenceLimit omitted (default) leaves the full reference list intact in both surfaces', async () => {
+      const references = Array.from({ length: 19 }, (_, i) => ({
+        pmid: `${20000 + i}`,
+        citation: `Reference ${i}.`,
+      }));
+      mockService.getStudy.mockResolvedValue(buildStudy({ referencesModule: { references } }));
+
+      const ctx = createMockContext({ errors: getStudy.errors });
+      const result = await getStudy.handler(getStudy.input!.parse({ nctId: 'NCT12345678' }), ctx);
+
+      const ps = (
+        result.study as {
+          protocolSection?: { referencesModule?: { references?: unknown[] } };
+        }
+      ).protocolSection;
+      expect(ps?.referencesModule?.references).toHaveLength(19);
+      expect(result.filtersApplied.totalReferences).toBeUndefined();
+
+      const text = (getStudy.format!(result)[0] as { text: string }).text;
+      expect(text).toContain('## References');
+      expect(text).not.toContain('## References (');
+      for (let i = 0; i < 19; i++) expect(text).toContain(`Reference ${i}.`);
+    });
+
+    it('referenceLimit preserves seeAlsoLinks uncapped (#73)', async () => {
+      mockService.getStudy.mockResolvedValue(
+        buildStudy({
+          referencesModule: {
+            references: Array.from({ length: 4 }, (_, i) => ({ citation: `Reference ${i}.` })),
+            seeAlsoLinks: Array.from({ length: 3 }, (_, i) => ({
+              label: `Link ${i}`,
+              url: `https://example.org/${i}`,
+            })),
+          },
+        }),
+      );
+
+      const ctx = createMockContext({ errors: getStudy.errors });
+      const result = await getStudy.handler(
+        getStudy.input!.parse({ nctId: 'NCT12345678', referenceLimit: 2 }),
+        ctx,
+      );
+
+      const ps = (
+        result.study as {
+          protocolSection?: {
+            referencesModule?: { references?: unknown[]; seeAlsoLinks?: unknown[] };
+          };
+        }
+      ).protocolSection;
+      expect(ps?.referencesModule?.references).toHaveLength(2);
+      expect(ps?.referencesModule?.seeAlsoLinks).toHaveLength(3);
+
+      const text = (getStudy.format!(result)[0] as { text: string }).text;
+      for (let i = 0; i < 3; i++) expect(text).toContain(`Link ${i}`);
+    });
+
+    it('omits filtersApplied caps when a limit does not trim anything (#80)', async () => {
+      // 1 location, 2 secondary outcomes, 1 reference — every cap exceeds the data.
+      mockService.getStudy.mockResolvedValue(
+        buildStudy({
+          contactsLocationsModule: { locations: [{ facility: 'Only Site', country: 'US' }] },
+          outcomesModule: { secondaryOutcomes: [{ measure: 'S0' }, { measure: 'S1' }] },
+          referencesModule: { references: [{ citation: 'Ref 0.' }] },
+        }),
+      );
+
+      const ctx = createMockContext({ errors: getStudy.errors });
+      const result = await getStudy.handler(
+        getStudy.input!.parse({
+          nctId: 'NCT12345678',
+          locationLimit: 2,
+          outcomeLimit: 5,
+          referenceLimit: 5,
+        }),
+        ctx,
+      );
+
+      // Nothing was trimmed → no caps or totals are reported.
+      expect(result.filtersApplied).toEqual({});
+      // Full data is still returned intact.
+      expect(getStructuredLocations(result)).toHaveLength(1);
+
+      const text = (getStudy.format!(result)[0] as { text: string }).text;
+      expect(text).not.toContain('Filters applied:');
+    });
+
+    it('reports outcomeLimit only for the list it actually trims (#80)', async () => {
+      // secondary (8) is trimmed by limit 3; other (2 ≤ 3) is not.
+      mockService.getStudy.mockResolvedValue(
+        buildStudy({
+          outcomesModule: {
+            secondaryOutcomes: Array.from({ length: 8 }, (_, i) => ({ measure: `S${i}` })),
+            otherOutcomes: [{ measure: 'O0' }, { measure: 'O1' }],
+          },
+        }),
+      );
+
+      const ctx = createMockContext({ errors: getStudy.errors });
+      const result = await getStudy.handler(
+        getStudy.input!.parse({ nctId: 'NCT12345678', outcomeLimit: 3 }),
+        ctx,
+      );
+
+      expect(result.filtersApplied.totalSecondaryOutcomes).toBe(8);
+      expect(result.filtersApplied.totalOtherOutcomes).toBeUndefined();
+      expect(result.filtersApplied.outcomeLimit).toBe(3);
+      expect(getStructuredSecondary(result)).toHaveLength(3);
+    });
+
+    it('nearLocation combined with locationLimit applies both in both surfaces', async () => {
+      const here = { lat: 47.6062, lon: -122.3321 };
+      mockService.getStudy.mockResolvedValue(
+        buildStudy({
+          contactsLocationsModule: {
+            locations: Array.from({ length: 6 }, (_, i) => ({
+              facility: `Site ${i}`,
+              geoPoint: { lat: here.lat + i * 0.01, lon: here.lon },
+            })),
+          },
+        }),
+      );
+
+      const ctx = createMockContext({ errors: getStudy.errors });
+      const result = await getStudy.handler(
+        getStudy.input!.parse({
+          nctId: 'NCT12345678',
+          nearLocation: { ...here, radiusMi: 100 },
+          locationLimit: 3,
+        }),
+        ctx,
+      );
+
+      const locs = getStructuredLocations(result) as Array<{ facility: string }>;
+      expect(locs).toHaveLength(3);
+      expect(locs.map((l) => l.facility)).toEqual(['Site 0', 'Site 1', 'Site 2']);
+
+      const text = (getStudy.format!(result)[0] as { text: string }).text;
+      expect(text).toContain('Site 0');
+      expect(text).toContain('Site 2');
+      expect(text).not.toContain('Site 3');
+    });
+  });
+
+  describe('format', () => {
+    it('renders study header with NCT ID and title', () => {
+      const blocks = getStudy.format!({
+        filtersApplied: {},
+        study: {
+          protocolSection: {
+            identificationModule: { nctId: 'NCT12345678', briefTitle: 'My Study' },
+          },
+        },
+      });
+      expect((blocks[0] as { text: string }).text).toContain('# Study NCT12345678: My Study');
+    });
+
+    it('falls back to officialTitle when briefTitle missing', () => {
+      const blocks = getStudy.format!({
+        filtersApplied: {},
+        study: {
+          protocolSection: {
+            identificationModule: { nctId: 'NCT12345678', officialTitle: 'Official Title' },
+          },
+        },
+      });
+      expect((blocks[0] as { text: string }).text).toContain('# Study NCT12345678: Official Title');
+    });
+
+    it('shows Untitled when no title', () => {
+      const blocks = getStudy.format!({
+        filtersApplied: {},
+        study: {
+          protocolSection: { identificationModule: { nctId: 'NCT12345678' } },
+        },
+      });
+      expect((blocks[0] as { text: string }).text).toContain('# Study NCT12345678: Untitled');
+    });
+
+    it('shows Unknown when no nctId', () => {
+      const blocks = getStudy.format!({ study: {}, filtersApplied: {} });
+      expect((blocks[0] as { text: string }).text).toContain('# Study Unknown: Untitled');
+    });
+
+    it('renders acronym', () => {
+      const blocks = getStudy.format!({
+        filtersApplied: {},
+        study: {
+          protocolSection: {
+            identificationModule: { nctId: 'NCT12345678', briefTitle: 'X', acronym: 'ACME' },
+          },
+        },
+      });
+      expect((blocks[0] as { text: string }).text).toContain('**Acronym:** ACME');
+    });
+
+    it('renders status with design info', () => {
+      const blocks = getStudy.format!({
+        filtersApplied: {},
+        study: {
+          protocolSection: {
+            identificationModule: { nctId: 'NCT12345678', briefTitle: 'X' },
+            statusModule: { overallStatus: 'RECRUITING' },
+            designModule: {
+              studyType: 'INTERVENTIONAL',
+              phases: ['PHASE3'],
+              enrollmentInfo: { count: 500 },
+            },
+          },
+        },
+      });
+      const text = (blocks[0] as { text: string }).text;
+      expect(text).toContain('RECRUITING');
+      expect(text).toContain('INTERVENTIONAL');
+      expect(text).toContain('PHASE3');
+      expect(text).toContain('N=500');
+    });
+
+    it('renders dates', () => {
+      const blocks = getStudy.format!({
+        filtersApplied: {},
+        study: {
+          protocolSection: {
+            identificationModule: { nctId: 'NCT12345678', briefTitle: 'X' },
+            statusModule: {
+              startDateStruct: { date: '2024-01-01' },
+              primaryCompletionDateStruct: { date: '2025-06-01' },
+              completionDateStruct: { date: '2025-12-31' },
+            },
+          },
+        },
+      });
+      const text = (blocks[0] as { text: string }).text;
+      expect(text).toContain('Start: 2024-01-01');
+      expect(text).toContain('Primary Completion: 2025-06-01');
+      expect(text).toContain('Completion: 2025-12-31');
+    });
+
+    it('renders sponsor with class', () => {
+      const blocks = getStudy.format!({
+        filtersApplied: {},
+        study: {
+          protocolSection: {
+            identificationModule: { nctId: 'NCT12345678', briefTitle: 'X' },
+            sponsorCollaboratorsModule: {
+              leadSponsor: { name: 'Pfizer', class: 'INDUSTRY' },
+            },
+          },
+        },
+      });
+      expect((blocks[0] as { text: string }).text).toContain('**Sponsor:** Pfizer (INDUSTRY)');
+    });
+
+    it('renders conditions', () => {
+      const blocks = getStudy.format!({
+        filtersApplied: {},
+        study: {
+          protocolSection: {
+            identificationModule: { nctId: 'NCT12345678', briefTitle: 'X' },
+            conditionsModule: { conditions: ['Diabetes', 'Hypertension'] },
+          },
+        },
+      });
+      expect((blocks[0] as { text: string }).text).toContain(
+        '**Conditions:** Diabetes, Hypertension',
+      );
+    });
+
+    it('renders summary', () => {
+      const blocks = getStudy.format!({
+        filtersApplied: {},
+        study: {
+          protocolSection: {
+            identificationModule: { nctId: 'NCT12345678', briefTitle: 'X' },
+            descriptionModule: { briefSummary: 'This study evaluates...' },
+          },
+        },
+      });
+      expect((blocks[0] as { text: string }).text).toContain('## Summary');
+      expect((blocks[0] as { text: string }).text).toContain('This study evaluates...');
+    });
+
+    it('renders eligibility section', () => {
+      const blocks = getStudy.format!({
+        filtersApplied: {},
+        study: {
+          protocolSection: {
+            identificationModule: { nctId: 'NCT12345678', briefTitle: 'X' },
+            eligibilityModule: {
+              minimumAge: '18 Years',
+              maximumAge: '65 Years',
+              sex: 'ALL',
+              healthyVolunteers: false,
+              stdAges: ['ADULT', 'OLDER_ADULT'],
+            },
+          },
+        },
+      });
+      const text = (blocks[0] as { text: string }).text;
+      expect(text).toContain('## Eligibility');
+      expect(text).toContain('18 Years');
+      expect(text).toContain('65 Years');
+      expect(text).toContain('**Sex:** ALL');
+      expect(text).toContain('**Healthy Volunteers:** No');
+      expect(text).toContain('ADULT, OLDER_ADULT');
+    });
+
+    it('renders eligibility with only minAge', () => {
+      const blocks = getStudy.format!({
+        filtersApplied: {},
+        study: {
+          protocolSection: {
+            identificationModule: { nctId: 'NCT12345678', briefTitle: 'X' },
+            eligibilityModule: { minimumAge: '18 Years' },
+          },
+        },
+      });
+      expect((blocks[0] as { text: string }).text).toMatch(/≥ 18 Years/);
+    });
+
+    it('renders eligibility with only maxAge', () => {
+      const blocks = getStudy.format!({
+        filtersApplied: {},
+        study: {
+          protocolSection: {
+            identificationModule: { nctId: 'NCT12345678', briefTitle: 'X' },
+            eligibilityModule: { maximumAge: '65 Years' },
+          },
+        },
+      });
+      expect((blocks[0] as { text: string }).text).toMatch(/≤ 65 Years/);
+    });
+
+    it('renders interventions', () => {
+      const blocks = getStudy.format!({
+        filtersApplied: {},
+        study: {
+          protocolSection: {
+            identificationModule: { nctId: 'NCT12345678', briefTitle: 'X' },
+            armsInterventionsModule: {
+              interventions: [
+                { type: 'DRUG', name: 'Aspirin', description: 'Low dose aspirin' },
+                { name: 'Placebo' },
+              ],
+            },
+          },
+        },
+      });
+      const text = (blocks[0] as { text: string }).text;
+      expect(text).toContain('## Interventions');
+      expect(text).toContain('**DRUG:** Aspirin');
+      expect(text).toContain('Low dose aspirin');
+      expect(text).toContain('**Intervention:** Placebo');
+    });
+
+    it('renders arm groups', () => {
+      const blocks = getStudy.format!({
+        filtersApplied: {},
+        study: {
+          protocolSection: {
+            identificationModule: { nctId: 'NCT12345678', briefTitle: 'X' },
+            armsInterventionsModule: {
+              armGroups: [
+                { label: 'Treatment', type: 'EXPERIMENTAL', description: 'Active drug' },
+                { label: 'Control', type: 'PLACEBO_COMPARATOR' },
+              ],
+            },
+          },
+        },
+      });
+      const text = (blocks[0] as { text: string }).text;
+      expect(text).toContain('## Arms');
+      expect(text).toContain('**Treatment** (EXPERIMENTAL)');
+      expect(text).toContain('Active drug');
+    });
+
+    it('renders primary and secondary outcomes', () => {
+      const blocks = getStudy.format!({
+        filtersApplied: {},
+        study: {
+          protocolSection: {
+            identificationModule: { nctId: 'NCT12345678', briefTitle: 'X' },
+            outcomesModule: {
+              primaryOutcomes: [{ measure: 'Overall Survival', timeFrame: '24 months' }],
+              secondaryOutcomes: [{ measure: 'PFS', timeFrame: '12 months' }, { measure: 'ORR' }],
+            },
+          },
+        },
+      });
+      const text = (blocks[0] as { text: string }).text;
+      expect(text).toContain('## Primary Outcomes');
+      expect(text).toContain('Overall Survival [24 months]');
+      expect(text).toContain('## Secondary Outcomes');
+      expect(text).toContain('PFS [12 months]');
+      expect(text).toContain('ORR');
+    });
+
+    it('renders every secondary outcome without truncation (regression for #46)', () => {
+      const secondaryOutcomes = Array.from({ length: 8 }, (_, i) => ({
+        measure: `Outcome ${i}`,
+      }));
+      const blocks = getStudy.format!({
+        filtersApplied: {},
+        study: {
+          protocolSection: {
+            identificationModule: { nctId: 'NCT12345678', briefTitle: 'X' },
+            outcomesModule: { secondaryOutcomes },
+          },
+        },
+      });
+      const text = (blocks[0] as { text: string }).text;
+      expect(text).not.toContain('... and');
+      for (let i = 0; i < 8; i++) expect(text).toContain(`Outcome ${i}`);
+    });
+
+    it('renders central contacts', () => {
+      const blocks = getStudy.format!({
+        filtersApplied: {},
+        study: {
+          protocolSection: {
+            identificationModule: { nctId: 'NCT12345678', briefTitle: 'X' },
+            contactsLocationsModule: {
+              centralContacts: [
+                { name: 'Dr. Smith', role: 'PI', phone: '555-1234', email: 'smith@test.com' },
+              ],
+            },
+          },
+        },
+      });
+      const text = (blocks[0] as { text: string }).text;
+      expect(text).toContain('## Contacts');
+      expect(text).toContain('Dr. Smith');
+      expect(text).toContain('smith@test.com');
+    });
+
+    it('renders locations with recruiting priority', () => {
+      const blocks = getStudy.format!({
+        filtersApplied: {},
+        study: {
+          protocolSection: {
+            identificationModule: { nctId: 'NCT12345678', briefTitle: 'X' },
+            contactsLocationsModule: {
+              locations: [
+                {
+                  facility: 'General Hospital',
+                  city: 'Seattle',
+                  state: 'WA',
+                  country: 'United States',
+                  status: 'RECRUITING',
+                },
+                {
+                  facility: 'Other Hospital',
+                  city: 'Portland',
+                  state: 'OR',
+                  country: 'United States',
+                  status: 'NOT_YET_RECRUITING',
+                },
+              ],
+            },
+          },
+        },
+      });
+      const text = (blocks[0] as { text: string }).text;
+      expect(text).toContain('## Locations (2 total)');
+      expect(text).toContain('General Hospital');
+      expect(text).toContain('[RECRUITING]');
+    });
+
+    it('renders detailedDescription section (regression for #18)', () => {
+      const blocks = getStudy.format!({
+        filtersApplied: {},
+        study: {
+          protocolSection: {
+            identificationModule: { nctId: 'NCT12345678', briefTitle: 'X' },
+            descriptionModule: {
+              briefSummary: 'Short summary.',
+              detailedDescription: 'Detailed multi-paragraph description goes here.',
+            },
+          },
+        },
+      });
+      const text = (blocks[0] as { text: string }).text;
+      expect(text).toContain('## Detailed Description');
+      expect(text).toContain('Detailed multi-paragraph description');
+    });
+
+    it('renders submission and update dates (regression for #18)', () => {
+      const blocks = getStudy.format!({
+        filtersApplied: {},
+        study: {
+          protocolSection: {
+            identificationModule: { nctId: 'NCT12345678', briefTitle: 'X' },
+            statusModule: {
+              studyFirstSubmitDate: '2020-01-15',
+              studyFirstPostDateStruct: { date: '2020-02-01' },
+              lastUpdateSubmitDate: '2024-06-10',
+              lastUpdatePostDateStruct: { date: '2024-06-15' },
+              statusVerifiedDate: '2024-06',
+            },
+          },
+        },
+      });
+      const text = (blocks[0] as { text: string }).text;
+      expect(text).toContain('First Submit: 2020-01-15');
+      expect(text).toContain('Last Update Post: 2024-06-15');
+      expect(text).toContain('Verified: 2024-06');
+    });
+
+    it('renders otherOutcomes (regression for #18)', () => {
+      const blocks = getStudy.format!({
+        filtersApplied: {},
+        study: {
+          protocolSection: {
+            identificationModule: { nctId: 'NCT12345678', briefTitle: 'X' },
+            outcomesModule: {
+              otherOutcomes: [{ measure: 'Exploratory Biomarker', timeFrame: '6 months' }],
+            },
+          },
+        },
+      });
+      expect((blocks[0] as { text: string }).text).toContain('## Other Outcomes');
+      expect((blocks[0] as { text: string }).text).toContain('Exploratory Biomarker [6 months]');
+    });
+
+    it('renders oversight module (regression for #18)', () => {
+      const blocks = getStudy.format!({
+        filtersApplied: {},
+        study: {
+          protocolSection: {
+            identificationModule: { nctId: 'NCT12345678', briefTitle: 'X' },
+            oversightModule: {
+              oversightHasDmc: true,
+              isFdaRegulatedDrug: true,
+              isFdaRegulatedDevice: false,
+            },
+          },
+        },
+      });
+      const text = (blocks[0] as { text: string }).text;
+      expect(text).toContain('**Oversight:**');
+      expect(text).toContain('DMC: Yes');
+      expect(text).toContain('FDA-Regulated Drug: Yes');
+      expect(text).toContain('FDA-Regulated Device: No');
+    });
+
+    it('renders ipdSharingStatementModule (regression for #18)', () => {
+      const blocks = getStudy.format!({
+        filtersApplied: {},
+        study: {
+          protocolSection: {
+            identificationModule: { nctId: 'NCT12345678', briefTitle: 'X' },
+            ipdSharingStatementModule: {
+              ipdSharing: 'YES',
+              timeFrame: '6 months after publication',
+              description: 'Individual participant data available upon request.',
+            },
+          },
+        },
+      });
+      const text = (blocks[0] as { text: string }).text;
+      expect(text).toContain('## IPD Sharing');
+      expect(text).toContain('**Plan:** YES');
+      expect(text).toContain('6 months after publication');
+    });
+
+    it('renders referencesModule (regression for #18)', () => {
+      const blocks = getStudy.format!({
+        filtersApplied: {},
+        study: {
+          protocolSection: {
+            identificationModule: { nctId: 'NCT12345678', briefTitle: 'X' },
+            referencesModule: {
+              references: [
+                {
+                  pmid: '12345',
+                  citation: 'Smith J. Relevant prior work. 2020.',
+                  type: 'BACKGROUND',
+                },
+              ],
+            },
+          },
+        },
+      });
+      const text = (blocks[0] as { text: string }).text;
+      expect(text).toContain('## References');
+      expect(text).toContain('Smith J. Relevant prior work');
+      expect(text).toContain('PMID: 12345');
+      expect(text).toContain('[BACKGROUND]');
+    });
+
+    it('renders collaborators (regression for #18)', () => {
+      const blocks = getStudy.format!({
+        filtersApplied: {},
+        study: {
+          protocolSection: {
+            identificationModule: { nctId: 'NCT12345678', briefTitle: 'X' },
+            sponsorCollaboratorsModule: {
+              leadSponsor: { name: 'Pfizer', class: 'INDUSTRY' },
+              collaborators: [
+                { name: 'NIH', class: 'FEDERAL' },
+                { name: 'Academic Partner', class: 'OTHER' },
+              ],
+            },
+          },
+        },
+      });
+      const text = (blocks[0] as { text: string }).text;
+      expect(text).toContain('**Collaborators:** NIH (FEDERAL), Academic Partner (OTHER)');
+    });
+
+    it('renders keywords (regression for #18)', () => {
+      const blocks = getStudy.format!({
+        filtersApplied: {},
+        study: {
+          protocolSection: {
+            identificationModule: { nctId: 'NCT12345678', briefTitle: 'X' },
+            conditionsModule: {
+              conditions: ['Diabetes'],
+              keywords: ['insulin resistance', 'glycemic control'],
+            },
+          },
+        },
+      });
+      expect((blocks[0] as { text: string }).text).toContain(
+        '**Keywords:** insulin resistance, glycemic control',
+      );
+    });
+
+    it('renders design details (regression for #18)', () => {
+      const blocks = getStudy.format!({
+        filtersApplied: {},
+        study: {
+          protocolSection: {
+            identificationModule: { nctId: 'NCT12345678', briefTitle: 'X' },
+            designModule: {
+              designInfo: {
+                allocation: 'RANDOMIZED',
+                interventionModel: 'PARALLEL',
+                primaryPurpose: 'TREATMENT',
+                maskingInfo: { masking: 'DOUBLE' },
+              },
+            },
+          },
+        },
+      });
+      const text = (blocks[0] as { text: string }).text;
+      expect(text).toContain('**Design:**');
+      expect(text).toContain('Allocation: RANDOMIZED');
+      expect(text).toContain('Model: PARALLEL');
+      expect(text).toContain('Purpose: TREATMENT');
+      expect(text).toContain('Masking: DOUBLE');
+    });
+
+    it('renders every location without truncation (regression for #46)', () => {
+      const locations = Array.from({ length: 30 }, (_, i) => ({
+        facility: `Hospital ${i}`,
+        country: 'US',
+      }));
+      const blocks = getStudy.format!({
+        filtersApplied: {},
+        study: {
+          protocolSection: {
+            identificationModule: { nctId: 'NCT12345678', briefTitle: 'X' },
+            contactsLocationsModule: { locations },
+          },
+        },
+      });
+      const text = (blocks[0] as { text: string }).text;
+      expect(text).toContain('## Locations (30 total)');
+      expect(text).not.toContain('... and');
+      for (let i = 0; i < 30; i++) expect(text).toContain(`Hospital ${i}`);
+    });
+
+    it('renders every reference without truncation (regression for #46)', () => {
+      const references = Array.from({ length: 15 }, (_, i) => ({
+        pmid: `${10000 + i}`,
+        citation: `Citation ${i}.`,
+      }));
+      const blocks = getStudy.format!({
+        filtersApplied: {},
+        study: {
+          protocolSection: {
+            identificationModule: { nctId: 'NCT12345678', briefTitle: 'X' },
+            referencesModule: { references },
+          },
+        },
+      });
+      const text = (blocks[0] as { text: string }).text;
+      expect(text).not.toContain('... and');
+      for (let i = 0; i < 15; i++) expect(text).toContain(`Citation ${i}.`);
+    });
+
+    it('renders resultsSummary counts and points to get_study_results (#63)', () => {
+      const blocks = getStudy.format!({
+        filtersApplied: {},
+        study: {
+          protocolSection: { identificationModule: { nctId: 'NCT02130466', briefTitle: 'X' } },
+          hasResults: true,
+        },
+        resultsSummary: {
+          outcomeMeasures: 2,
+          seriousAdverseEvents: 87,
+          otherAdverseEvents: 328,
+          participantFlowPeriods: 1,
+          baselineMeasures: 1,
+        },
+      });
+      const text = (blocks[0] as { text: string }).text;
+      expect(text).toContain('## Results Summary');
+      expect(text).toContain('2 outcome measures');
+      expect(text).toContain('87 serious adverse events');
+      expect(text).toContain('328 other adverse events');
+      expect(text).toContain('1 participant flow periods');
+      expect(text).toContain('1 baseline measures');
+      expect(text).toContain('Use clinicaltrials_get_study_results for full data.');
+    });
+
+    it('renders a date struct type alongside its date (#18)', () => {
+      const blocks = getStudy.format!({
+        filtersApplied: {},
+        study: {
+          protocolSection: {
+            identificationModule: { nctId: 'NCT12345678', briefTitle: 'X' },
+            statusModule: {
+              startDateStruct: { date: '2024-01-01', type: 'ACTUAL' },
+              completionDateStruct: { date: '2026-01-01', type: 'ESTIMATED' },
+            },
+          },
+        },
+      });
+      const text = (blocks[0] as { text: string }).text;
+      expect(text).toContain('Start: 2024-01-01 (ACTUAL)');
+      expect(text).toContain('Completion: 2026-01-01 (ESTIMATED)');
+    });
+
+    it('renders outcome descriptions, not just measure and timeFrame (#18)', () => {
+      const blocks = getStudy.format!({
+        filtersApplied: {},
+        study: {
+          protocolSection: {
+            identificationModule: { nctId: 'NCT12345678', briefTitle: 'X' },
+            outcomesModule: {
+              primaryOutcomes: [
+                {
+                  measure: 'Reactogenicity',
+                  timeFrame: '7 days',
+                  description: 'Number of subjects with solicited injection site reactions.',
+                },
+              ],
+            },
+          },
+        },
+      });
+      const text = (blocks[0] as { text: string }).text;
+      expect(text).toContain('Reactogenicity [7 days]');
+      expect(text).toContain('Number of subjects with solicited injection site reactions.');
+    });
+
+    it('renders masking detail, secondary ID provenance, and arm interventions (#18)', () => {
+      const blocks = getStudy.format!({
+        filtersApplied: {},
+        study: {
+          protocolSection: {
+            identificationModule: {
+              nctId: 'NCT12345678',
+              briefTitle: 'X',
+              secondaryIdInfos: [
+                { id: 'DMID 17-0104', type: 'OTHER', domain: 'NIH/NIAID/DMID' },
+                { id: 'GRANT-1', type: 'NIH', link: 'https://reporter.nih.gov/x' },
+              ],
+            },
+            designModule: {
+              designInfo: {
+                maskingInfo: {
+                  masking: 'QUADRUPLE',
+                  whoMasked: ['PARTICIPANT', 'INVESTIGATOR'],
+                  maskingDescription: 'Pharmacist unblinded.',
+                },
+              },
+            },
+            armsInterventionsModule: {
+              armGroups: [
+                { label: 'Arm A', type: 'EXPERIMENTAL', interventionNames: ['Biological: ID93'] },
+              ],
+            },
+          },
+        },
+      });
+      const text = (blocks[0] as { text: string }).text;
+      expect(text).toContain('Masking: QUADRUPLE (PARTICIPANT, INVESTIGATOR)');
+      expect(text).toContain('**Masking Description:** Pharmacist unblinded.');
+      expect(text).toContain('OTHER: DMID 17-0104 (NIH/NIAID/DMID)');
+      expect(text).toContain('NIH: GRANT-1 (https://reporter.nih.gov/x)');
+      expect(text).toContain('Interventions: Biological: ID93');
+    });
+
+    it('renders observational design and cohort fields (#18)', () => {
+      const blocks = getStudy.format!({
+        filtersApplied: {},
+        study: {
+          protocolSection: {
+            identificationModule: { nctId: 'NCT12345678', briefTitle: 'X' },
+            designModule: {
+              studyType: 'OBSERVATIONAL',
+              patientRegistry: false,
+              designInfo: { observationalModel: 'COHORT', timePerspective: 'PROSPECTIVE' },
+              bioSpec: { retention: 'SAMPLES_WITH_DNA', description: 'fasting blood samples' },
+            },
+            eligibilityModule: {
+              samplingMethod: 'NON_PROBABILITY_SAMPLE',
+              studyPopulation: 'Vegans, vegetarians, pescetarians, and omnivores.',
+            },
+            statusModule: { expandedAccessInfo: { hasExpandedAccess: false } },
+          },
+        },
+      });
+      const text = (blocks[0] as { text: string }).text;
+      expect(text).toContain('Observational Model: COHORT');
+      expect(text).toContain('Time Perspective: PROSPECTIVE');
+      expect(text).toContain('**Patient Registry:** No');
+      expect(text).toContain('**Biospecimens:** SAMPLES_WITH_DNA — fasting blood samples');
+      expect(text).toContain('**Sampling Method:** NON_PROBABILITY_SAMPLE');
+      expect(text).toContain('**Study Population:**');
+      expect(text).toContain('Vegans, vegetarians, pescetarians, and omnivores.');
+      expect(text).toContain('**Expanded Access:** Available: No');
+    });
+  });
+
+  describe('rarely-populated record sections (#18)', () => {
+    it('renders annotations, submission tracking, removed countries, and retractions', () => {
+      const output = {
+        study: {
+          protocolSection: {
+            identificationModule: { nctId: 'NCT12345678', briefTitle: 'X' },
+            statusModule: {
+              dispFirstSubmitDate: '2021-03-01',
+              dispFirstPostDateStruct: { date: '2021-03-15', type: 'ACTUAL' },
+            },
+            referencesModule: {
+              references: [
+                {
+                  citation: 'Smith J. Withdrawn work. 2019.',
+                  pmid: '30000001',
+                  retractions: [{ pmid: '30000002', source: 'Journal of Retractions' }],
+                },
+              ],
+            },
+          },
+          annotationSection: {
+            annotationModule: {
+              unpostedAnnotation: {
+                unpostedResponsibleParty: 'Acme Sponsor',
+                unpostedEvents: [{ type: 'RESET', date: '2020-05-01' }],
+              },
+              violationAnnotation: {
+                violationEvents: [
+                  {
+                    type: 'VIOLATION_IDENTIFIED',
+                    description: 'Results not submitted within the statutory deadline.',
+                    creationDate: '2020-06-01',
+                    issuedDate: '2020-06-15',
+                  },
+                ],
+              },
+            },
+          },
+          derivedSection: {
+            miscInfoModule: {
+              versionHolder: '2026-07-24',
+              removedCountries: ['Denmark', 'Israel'],
+              submissionTracking: {
+                estimatedResultsFirstSubmitDate: '2021-01-01',
+                firstMcpInfo: { postDateStruct: { date: '2020-12-01', type: 'ACTUAL' } },
+                submissionInfos: [{ mcpReleaseN: 2, releaseDate: '2020-11-01' }],
+              },
+            },
+          },
+        },
+        filtersApplied: {},
+      };
+      const text = (getStudy.format!(output)[0] as { text: string }).text;
+      expect(missingLeaves(output, text)).toEqual([]);
+      expect(text).toContain('Disposition First Post: 2021-03-15 (ACTUAL)');
+      expect(text).toContain('Retracted — Journal of Retractions, PMID: 30000002');
+      expect(text).toContain('## Annotations');
+      expect(text).toContain('**Unposted Responsible Party:** Acme Sponsor');
+      expect(text).toContain('Results not submitted within the statutory deadline.');
+      expect(text).toContain('**Removed Countries:** Denmark, Israel');
+      expect(text).toContain('First MCP Post: 2020-12-01 (ACTUAL)');
+      expect(text).toContain('*Data version: 2026-07-24*');
+    });
+  });
+
+  describe('channel parity — every populated leaf reaches content[] (#18)', () => {
+    /**
+     * Reverse parity against verbatim API records: walk structuredContent for
+     * primitive leaves and require each one to appear in the rendered text. This
+     * catches upstream fields the formatter has never been taught, which a
+     * per-section assertion list cannot.
+     */
+    const renderFixture = async (fixture: string, nctId: string) => {
+      mockService.getStudy.mockResolvedValue(loadStudyFixture(fixture));
+      const ctx = createMockContext({ errors: getStudy.errors });
+      const result = await getStudy.handler(getStudy.input!.parse({ nctId }), ctx);
+      return { result, text: (getStudy.format!(result)[0] as { text: string }).text };
+    };
+
+    it('renders every leaf of an interventional record (NCT03722472)', async () => {
+      const { result, text } = await renderFixture('nct03722472', 'NCT03722472');
+      expect(missingLeaves(result, text)).toEqual([]);
+      // Leaves the formatter previously dropped, spot-checked by value.
+      expect(text).toContain(
+        'The number of subjects experiencing solicited local injection site reactions within 7 days',
+      );
+      expect(text).toContain(
+        'Masking: QUADRUPLE (PARTICIPANT, CARE_PROVIDER, INVESTIGATOR, OUTCOMES_ASSESSOR)',
+      );
+      expect(text).toContain('OTHER: DMID 17-0104 (NIH/NIAID/DMID)');
+      expect(text).toContain('Interventions: Biological: ID93 + GLA-SE');
+      expect(text).toContain('Start: 2018-10-02 (ACTUAL)');
+      expect(text).toContain('N=48 (ACTUAL)');
+      expect(text).toContain('**Expanded Access:** Available: No');
+    });
+
+    it('renders every leaf of an observational record (NCT06323538)', async () => {
+      const { result, text } = await renderFixture('nct06323538', 'NCT06323538');
+      expect(missingLeaves(result, text)).toEqual([]);
+      // Observational studies exercise a design/eligibility subtree that
+      // interventional records never populate.
+      expect(text).toContain('Observational Model: COHORT');
+      expect(text).toContain('Time Perspective: PROSPECTIVE');
+      expect(text).toContain('**Patient Registry:** No');
+      expect(text).toContain('SAMPLES_WITH_DNA');
+      expect(text).toContain('**Sampling Method:** NON_PROBABILITY_SAMPLE');
+      expect(text).toContain('Vegans - no consumption of animal products');
+    });
+
+    it('keeps parity when the caller applies handler-level limits (NCT06323538)', async () => {
+      mockService.getStudy.mockResolvedValue(loadStudyFixture('nct06323538'));
+      const ctx = createMockContext({ errors: getStudy.errors });
+      const result = await getStudy.handler(
+        getStudy.input!.parse({ nctId: 'NCT06323538', outcomeLimit: 2, locationLimit: 2 }),
+        ctx,
+      );
+      const text = (getStudy.format!(result)[0] as { text: string }).text;
+      // Limits shape both channels at the handler, so parity still holds.
+      expect(missingLeaves(result, text)).toEqual([]);
+      expect(text).toContain('outcomeLimit=2');
+    });
+  });
+});

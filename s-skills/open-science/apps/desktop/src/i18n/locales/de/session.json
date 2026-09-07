@@ -1,0 +1,443 @@
+{
+  "notFound": {
+    "title": "Sitzung nicht gefunden",
+    "hint": "Wählen Sie eine Sitzung aus der Seitenleiste."
+  },
+  "group": {
+    "defaultName": "Bildschirm {{n}}",
+    "newTab": "Neuer Bildschirm",
+    "close": "Bildschirm schließen",
+    "renameHint": "Zum Umbenennen doppelklicken",
+    "splitRight": "Nach rechts teilen — eine neue Sitzung daneben öffnen",
+    "splitDown": "Nach unten teilen — eine neue Sitzung darunter öffnen",
+    "closePane": "Dieses Bereich schließen",
+    "confirmClose": {
+      "title": "Dieses Panel schließen?",
+      "body": "Dadurch wird nur das Panel von diesem Bildschirm entfernt. Sitzung, Gesprächsverlauf und Arbeitsbereichsdateien bleiben erhalten.",
+      "action": "Panel schließen"
+    },
+    "confirmCloseScreen": {
+      "title": "Diesen Bildschirm schließen?",
+      "body": "Dadurch werden der Bildschirm und alle darin enthaltenen Panels entfernt. Sitzungen, Gesprächsverlauf und Arbeitsbereichsdateien bleiben erhalten.",
+      "action": "Bildschirm schließen"
+    },
+    "zoom": "Dieses Bereich zoomen",
+    "empty": {
+      "title": "Leerer Bildschirm",
+      "hint": "Ziehen Sie eine Sitzung aus der Seitenleiste hierher, um zu beginnen, oder drücken Sie ⌘D zum Teilen.",
+      "newSession": "Neue Sitzung"
+    },
+    "rename": "Screen umbenennen",
+    "tabMenu": "Screen-Aktionen"
+  },
+  "composer": {
+    "placeholder": {
+      "default": "Fragen Sie irgendetwas",
+      "arguments": "Argumente (optional) — Enter zum Ausführen",
+      "shell": "Einen Shell-Befehl im Arbeitsbereichsordner ausführen",
+      "plan": "Beschreibe, was geplant werden soll — keine Dateien werden geändert"
+    },
+    "commandsAria": "Befehle",
+    "source": {
+      "skill": "skill",
+      "mcp": "mcp"
+    },
+    "file": {
+      "removeAria": "{{name}} entfernen"
+    },
+    "attach": {
+      "addAria": "Dateien hinzufügen",
+      "title": "Lokale Dateien zum Arbeitsbereich hinzufügen"
+    },
+    "command": {
+      "chipTitle": "Führt diesen Befehl aus — Argumente eingeben oder Rücktaste drücken, um den Namen zu bearbeiten",
+      "removeAria": "Befehl entfernen"
+    },
+    "shellMode": {
+      "badge": "shell",
+      "title": "Läuft direkt im Arbeitsbereichsordner der Sitzung"
+    },
+    "stop": {
+      "aria": "Stopp",
+      "title": "Diesen Zug unterbrechen (Esc)"
+    },
+    "send": {
+      "aria": "Senden"
+    },
+    "agent": {
+      "aria": "Agentenmodus",
+      "title": "Erst planen oder direkt umsetzen",
+      "menuAria": "Agentenmodi",
+      "menuTitle": "Wie soll der Agent arbeiten?",
+      "build": {
+        "label": "Umsetzen",
+        "description": "Bearbeitet Dateien und führt Befehle aus"
+      },
+      "plan": {
+        "label": "Planen",
+        "description": "Nur lesen: recherchiert und schreibt zuerst einen Plan"
+      }
+    },
+    "approval": {
+      "aria": "Genehmigungsmodus",
+      "title": "Wie Agentenaktionen genehmigt werden",
+      "menuAria": "Genehmigungsmodi",
+      "menuTitle": "Wie sollen Agentenaktionen genehmigt werden?",
+      "approve": {
+        "label": "Für mich genehmigen",
+        "description": "Fragt vor dem Löschen, Installieren oder Herstellen von Remote-Verbindungen nach"
+      },
+      "full": {
+        "label": "Vollzugriff",
+        "description": "Führt jeden Befehl ohne Rückfrage aus"
+      }
+    },
+    "error": {
+      "paste": "Einfügen konnte nicht gespeichert werden: {{message}}",
+      "addFiles": "Dateien konnten nicht hinzugefügt werden: {{message}}"
+    },
+    "model": {
+      "aria": "Modell wechseln",
+      "title": "Modell & Denkaufwand",
+      "search": "Modelle suchen…",
+      "none": "Modell wählen",
+      "empty": "Noch keine Modelle. Verbinde einen Anbieter.",
+      "noResults": "Keine passenden Modelle",
+      "favorite": "Favorit",
+      "manage": "Anbieter verwalten…",
+      "close": "Schließen",
+      "filter": {
+        "all": "Alle",
+        "favorites": "Favoriten",
+        "recent": "Zuletzt"
+      },
+      "reasoning": "Denkaufwand",
+      "reasoningDefault": "Modellstandard",
+      "faster": "Schneller",
+      "smarter": "Klüger",
+      "followingAgent": "Folgt dem Agenten {{agent}}",
+      "followAgent": "Dem Agenten {{agent}} folgen",
+      "useDefault": "Globale Vorgabe verwenden",
+      "unknownContextTitle": "Kontextfenster unbekannt",
+      "unknownContextBody": "Die automatische Komprimierung bleibt für dieses Modell aus, das Gespräch wächst unbegrenzt und lange Durchläufe bleiben irgendwann hängen. Fenstergröße unter Einstellungen → Modelle setzen.",
+      "retiredTitle": "Modell vom Anbieter eingestellt",
+      "retiredBody": "{{model}} ist weiterhin konfiguriert, wird vom Anbieter aber nicht mehr bereitgestellt, daher schlägt jeder Durchlauf fehl. Oben ein anderes Modell wählen."
+    },
+    "reference": {
+      "filesAria": "Dateien im Arbeitsbereich",
+      "sessionsAria": "Frühere Unterhaltungen",
+      "scanning": "Arbeitsbereich wird gelesen…",
+      "chipTitle": "Diese Unterhaltung wird für den Agenten zitiert",
+      "removeAria": "Verweis auf {{title}} entfernen"
+    },
+    "compact": {
+      "aria": "Kontext komprimieren",
+      "title": "Fasst frühere Turns zusammen; die nächste Antwort nutzt den komprimierten Kontext"
+    }
+  },
+  "localCommand": {
+    "newDescription": "Chat-Kontext in diesem Ordner leeren",
+    "clearDescription": "Wie /new; Dateien bleiben in diesem Ordner",
+    "cleared": "Chat-Kontext geleert. Dateien bleiben im selben Ordner."
+  },
+  "starters": {
+    "newSession": "Neue Sitzung",
+    "heading": "Was sollen wir untersuchen?",
+    "subheading": "Beschreiben Sie Ihre Analyse unten — oder beginnen Sie mit einem dieser Vorschläge.",
+    "demo": {
+      "title": "Eine Demo-Analyse End-to-End ausführen",
+      "description": "Einen Datensatz simulieren, ein Modell anpassen und eine Abbildung sowie einen nachvollziehbaren Bericht erstellen."
+    },
+    "analyze": {
+      "title": "Meine Daten analysieren",
+      "description": "Weisen Sie den Agenten auf eine hinzugefügte Datei hin; erhalten Sie Abbildungen und einen Bericht zurück."
+    },
+    "audit": {
+      "title": "Bericht auf Nachvollziehbarkeit prüfen",
+      "description": "Zitate, unbelegte Zahlen und die Übereinstimmung von Abbildung und Code prüfen."
+    },
+    "example-climate": {
+      "title": "Ein Beispiel erkunden: Klimatrends",
+      "description": "Echte NASA-GISTEMP-Daten — Trend, Dekadenvergleich, Abbildung und Bericht."
+    },
+    "error": {
+      "setup": "Das Beispiel konnte nicht eingerichtet werden: {{message}}"
+    }
+  },
+  "live": {
+    "starting": {
+      "bodyWeb": "Warte auf eine Antwort der Host-App. Lassen Sie diese Seite offen — sie verbindet sich von selbst, sobald der Host erreichbar ist.",
+      "title": "Lokale Runtime wird gestartet…",
+      "body": "Die gebündelte Agent-Runtime startet. Beim ersten Start fragt macOS möglicherweise nach Zugriff auf Ihre Ordner — erlauben Sie ihn, dann schließt der Vorgang von selbst ab."
+    },
+    "runtime": {
+      "title": "OpenCode-Runtime",
+      "bodyPrefix": "Die Desktop-App führt automatisch eine gebündelte OpenCode-Instanz aus. Starten Sie im Browser eine mit",
+      "bodySuffix": " und verbinden Sie sich."
+    },
+    "connect": "Verbinden",
+    "latest": "Neueste",
+    "subagentFallback": "ein Subagent",
+    "header": {
+      "expandSidebarAria": "Seitenleiste ausklappen",
+      "expandSidebarTitle": "Seitenleiste ausklappen ({{shortcut}})"
+    },
+    "filesToggle": {
+      "default": "Dateien",
+      "title": "Den Ordner dieser Sitzung neben dem Chat durchsuchen"
+    },
+    "runsToggle": {
+      "label": "Durchläufe",
+      "title": "Die Experimentdurchläufe dieser Sitzung — neben dem Chat"
+    },
+    "notebook": {
+      "chooseTitle": "Notebook auswählen",
+      "openTitle": "{{path}} öffnen — der Agent arbeitet in dieser Sitzung an diesem Notebook"
+    },
+    "connBadge": {
+      "title": "OpenCode · {{status}}",
+      "status": {
+        "ready": "bereit",
+        "connecting": "verbindet …",
+        "error": "Fehler",
+        "offline": "offline"
+      }
+    },
+    "status": {
+      "paused": "Pausiert — der Agent benötigt Ihre Antwort unten",
+      "startingSession": "Die Sitzung wird in ihrem Ordner gestartet…",
+      "retrying": "Anbieterfehler — neuer Versuch (Versuch {{attempt}})",
+      "limitReached": "Anbieterlimit erreicht — Warten hilft nicht",
+      "working": "Arbeitet…",
+      "step": "Schritt {{count}}"
+    },
+    "review": {
+      "queued": "Hintergrundprüfung wartet…",
+      "running": "Dieser Prüfpunkt wird im Hintergrund geprüft…",
+      "cancelAria": "Hintergrundprüfung stoppen",
+      "cancelTitle": "Diese Prüfung stoppen"
+    },
+    "placeholder": {
+      "starting": "Runtime wird gestartet…",
+      "disconnected": "Zum Chatten verbinden",
+      "waiting": "Warte auf die Antwort…",
+      "readOnly": "Nur-Lese-Zugriff — nur Ansicht"
+    }
+  },
+  "tool": {
+    "status": {
+      "pending": "Ausstehend",
+      "running": "Läuft",
+      "waiting-approval": "Wartet",
+      "success": "Erfolg",
+      "warning": "Warnung",
+      "failed": "Fehlgeschlagen"
+    },
+    "verb": {
+      "Ran": "Ausgeführt",
+      "Created": "Erstellt",
+      "Edited": "Bearbeitet",
+      "Read": "Gelesen",
+      "Searched": "Durchsucht",
+      "Listed": "Aufgelistet",
+      "Fetched": "Abgerufen"
+    },
+    "group": {
+      "phrase": {
+        "ran_one": "führte einen Befehl aus",
+        "ran_other": "führte {{count}} Befehle aus",
+        "created_one": "erstellte eine Datei",
+        "created_other": "erstellte {{count}} Dateien",
+        "edited_one": "bearbeitete eine Datei",
+        "edited_other": "bearbeitete {{count}} Dateien",
+        "read_one": "las eine Datei",
+        "read_other": "las {{count}} Dateien",
+        "searched_one": "führte eine Suche aus",
+        "searched_other": "führte {{count}} Suchen aus",
+        "listed": "listete Dateien auf",
+        "fetched_one": "rief eine Seite ab",
+        "fetched_other": "rief {{count}} Seiten ab",
+        "default_one": "führte einen Schritt aus",
+        "default_other": "führte {{count}} Schritte aus"
+      },
+      "failedCount": "{{count}} fehlgeschlagen"
+    }
+  },
+  "artifact": {
+    "kind": {
+      "figure": "Abbildung",
+      "script": "Skript",
+      "report": "Bericht",
+      "table": "Tabelle",
+      "notebook": "Notebook",
+      "model": "Modell",
+      "data": "Daten"
+    },
+    "via": "· über {{tool}}",
+    "open": "Öffnen"
+  },
+  "figure": {
+    "downloadAria": "Abbildung herunterladen",
+    "addAnnotationAria": "Anmerkung hinzufügen",
+    "annotationAria": "Anmerkung {{index}}: {{note}}",
+    "notePlaceholder": "Eine Notiz hinzufügen…",
+    "noteAria": "Anmerkungsnotiz",
+    "send": "Senden"
+  },
+  "reviewer": {
+    "heading": "Prüfer",
+    "badge": {
+      "warn": "Warnung",
+      "ok": "OK",
+      "error": "Fehler"
+    },
+    "checkTag": {
+      "citation": "Zitat",
+      "number": "Zahl",
+      "figure": "Abbildung ↔ Code",
+      "domain": "Fachgebiet",
+      "integrity": "Integrität"
+    },
+    "findingCount_one": "· {{count}} Befund",
+    "findingCount_other": "· {{count}} Befunde",
+    "dismissedCount": "· {{count}} verworfen",
+    "dismissAria": "Befund verwerfen: {{title}}",
+    "dismissTitle": "Diesen Befund verwerfen",
+    "allDismissed": "Alle Befunde verworfen."
+  },
+  "interaction": {
+    "question": {
+      "heading": "Der Agent benötigt Ihre Eingabe",
+      "customPlaceholder": "Oder geben Sie Ihre eigene Antwort ein…",
+      "other": "Etwas anderes…"
+    },
+    "permission": {
+      "heading": "Der Agent bittet um Erlaubnis:"
+    },
+    "askedBy": "Gefragt von {{origin}}",
+    "skip": "Überspringen",
+    "submit": "Absenden",
+    "reject": "Ablehnen",
+    "alwaysAllow": "Immer erlauben",
+    "allowOnce": "Einmal erlauben"
+  },
+  "reasoning": {
+    "thinking": "Denkt nach…",
+    "thought": "Nachgedacht"
+  },
+  "stepSummary": {
+    "steps": "{{count}} Schritte"
+  },
+  "thread": {
+    "exampleBadge": "Beispiel · nur lesbar",
+    "sampleNotice": "Dies ist eine Beispielsitzung. Starten Sie eine Live-Agentensitzung, um wirklich zu chatten."
+  },
+  "workspaceChip": {
+    "fallbackName": "Arbeitsbereich",
+    "titlePinned": "{{workspace}} — klicken, um einen anderen Ordner zu wählen",
+    "titleUnpinned": "Startet in einem neuen, datierten Ordner ({{name}}) — klicken, um stattdessen einen Ordner zu wählen",
+    "chooseAria": "Sitzungsordner wählen",
+    "switching": "Wird gewechselt…"
+  },
+  "agentMessage": {
+    "previewTitle": "Vorschau von {{path}}"
+  },
+  "goal": {
+    "label": "Ziel",
+    "running": "läuft",
+    "runningTurns": "Auto-Runde {{count}}",
+    "paused": "pausiert",
+    "done": "fertig",
+    "pauseAria": "Ziel pausieren (stoppt die Auto-Fortsetzung)",
+    "resumeAria": "Ziel fortsetzen",
+    "clearAria": "Ziel entfernen",
+    "unmet": "blockiert",
+    "limited": "Limit erreicht"
+  },
+  "message": {
+    "copy": "Kopieren",
+    "copied": "Kopiert",
+    "copyFailed": "Konnte nicht in die Zwischenablage kopieren.",
+    "edit": "Bearbeiten",
+    "editing": {
+      "cancel": "Abbrechen",
+      "send": "Senden"
+    },
+    "revert": "Zurücksetzen",
+    "confirm": {
+      "title": "Alles danach verwerfen?",
+      "body": "Dies setzt die Unterhaltung auf diese Nachricht zurück und verwirft sie sowie alle nachfolgenden Nachrichten samt der in diesen Runden vorgenommenen Dateiänderungen. Das lässt sich nicht rückgängig machen.",
+      "edit": "Bearbeiten & erneut senden",
+      "revert": "Hierher zurücksetzen"
+    }
+  },
+  "historyRepair": {
+    "reason": {
+      "text-missing": "Eine gespeicherte Nachricht in dieser Unterhaltung hat keinen Text, wo das Format des Modells ihn verlangt — meist eine Antwort, die gleich zu Beginn abbrach.",
+      "tool-result-missing": "Einem gespeicherten {{tool}}-Schritt fehlt das Ergebnis, das er gemeldet hat.",
+      "tool-error-missing": "Ein gespeicherter {{tool}}-Schritt ist fehlgeschlagen, ohne den Grund festzuhalten.",
+      "tool-call-id-missing": "Einem gespeicherten Werkzeugschritt fehlt die ID, die ihn seinem Ergebnis zuordnet.",
+      "unknown": "Diese Unterhaltung lässt sich nicht mehr an das Modell senden, und wir konnten nicht feststellen, welche gespeicherte Nachricht dafür verantwortlich ist."
+    },
+    "someTool": "Werkzeug",
+    "offer_one": "Ein Rücksprung davor verwirft {{count}} Nachricht und behebt das Problem.",
+    "offer_other": "Ein Rücksprung davor verwirft {{count}} Nachrichten und behebt das Problem.",
+    "noTarget": "Es gibt keinen früheren Punkt zum Zurückspringen, daher lässt sich diese Unterhaltung nicht reparieren — bitte eine neue beginnen. Es wird nichts gelöscht; Lesen und Exportieren bleibt möglich.",
+    "action": "Unterhaltung reparieren",
+    "confirm": {
+      "title": "Vor die beschädigte Nachricht zurückspringen?",
+      "body_one": "Das verwirft {{count}} Nachricht und macht die Dateiänderungen dieses Zuges rückgängig. Deine Eingabe kehrt in das Eingabefeld zurück. Das lässt sich nicht widerrufen.",
+      "body_other": "Das verwirft {{count}} Nachrichten und macht die Dateiänderungen dieser Züge rückgängig. Deine Eingabe kehrt in das Eingabefeld zurück. Das lässt sich nicht widerrufen.",
+      "action": "Zurückspringen"
+    }
+  },
+  "compaction": {
+    "label": "Kontext verdichtet",
+    "autoBody": "Die Laufzeit hat die früheren Züge zusammengefasst, um im Kontextfenster dieses Modells zu bleiben; die Unterhaltung ging hier weiter.",
+    "manualBody": "Sie haben die Zusammenfassung der früheren Züge angefordert; die Unterhaltung ging hier weiter.",
+    "overflowBody": "Auslöser war ein bereits vollgelaufener Kontext.",
+    "at": "Zeitpunkt: {{time}}",
+    "originalKept": "Die vollständige ursprüngliche Unterhaltung bleibt lokal gespeichert."
+  },
+  "meta": {
+    "context": "{{used}} / {{limit}} ({{percent}} %)",
+    "contextUnknown": "{{used}} Tokens",
+    "durationTitle": "Dauer dieser Antwort",
+    "costTitle": "Kosten dieses Zuges",
+    "tooltip": {
+      "input": "Eingabe: {{n}}",
+      "cacheRead": "Cache gelesen: {{n}}",
+      "cacheWrite": "Cache geschrieben: {{n}}",
+      "output": "Ausgabe: {{n}}",
+      "reasoning": "Schlussfolgern: {{n}}",
+      "context": "Belegter Kontext: {{used}} von {{limit}}",
+      "contextUnknown": "Belegter Kontext: {{used}} (Fenster unbekannt)"
+    }
+  },
+  "selection": {
+    "aria": "Aktionen für den markierten Text",
+    "quote": "Zitieren",
+    "explain": "Erklären",
+    "explainPrompt": "Erkläre diesen Teil ausführlicher.",
+    "remember": "Ins Gedächtnis speichern",
+    "savedProject": "Im Gedächtnis von {{name}} gespeichert",
+    "savedGlobal": "Im globalen Gedächtnis gespeichert"
+  },
+  "subagents": {
+    "title": "Subagenten",
+    "toggleTitle": "Zeigen, was die Subagenten tun",
+    "closeAria": "Subagenten-Panel schließen",
+    "count_one": "{{count}} Aufgabe",
+    "count_other": "{{count}} Aufgaben",
+    "empty": "In dieser Unterhaltung gibt es noch keine Subagenten.",
+    "noDetail": "Für diesen Subagenten wurden keine Schritte aufgezeichnet.",
+    "loadingDetail": "Wird geladen…",
+    "openRow": "Diesen Subagenten im Panel öffnen"
+  },
+  "splitDestination": {
+    "title": "Sitzung des neuen Bereichs wird angelegt in",
+    "continueIn": "In {{name}} fortfahren",
+    "newFolder": "Neuer Ordner",
+    "chooseOther": "Anderen Ordner wählen…"
+  }
+}

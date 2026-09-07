@@ -1,0 +1,212 @@
+import pprint
+import sys
+import re
+import pytest
+import numpy as np
+from qcelemental.testing import compare, compare_values
+from addons import uusing
+import psi4
+
+pytestmark = [pytest.mark.psi, pytest.mark.api]
+
+_sch_name = {1: "qcschema_output", 2: "qcschema_atomic_result"}
+_ispy314 = sys.version_info >= (3, 14)
+
+_tot_cp_ene = -155.40761029
+_ie_cp_ene = -0.00172611
+_tot_uncp_ene = -155.40887161
+_ie_uncp_ene = -0.00298743
+
+_tot_cp_grad = np.array(
+    [[-0.            ,  0.003989481299,  0.000257671876],
+     [ 0.            , -0.003989481299,  0.000257671876],
+     [-0.007206301768,  0.004333142371,  0.000029433226],
+     [ 0.007206301768,  0.004333142371,  0.000029433226],
+     [ 0.007206301768, -0.004333142371,  0.000029433226],
+     [-0.007206301768, -0.004333142371,  0.000029433226],
+     [-0.            , -0.            , -0.035555548002],
+     [-0.            ,  0.            ,  0.035547129205],
+     [ 0.            , -0.            ,  0.00840988492 ],
+     [ 0.            ,  0.            , -0.009034542779]])
+_ie_cp_grad = np.array(
+    [[-0.           ,   0.000831523566,  0.000095334214],
+     [ 0.           ,  -0.000831523566,  0.000095334214],
+     [-0.00011127085,   0.000096261386,  0.000110602057],
+     [ 0.00011127085,   0.000096261386,  0.000110602057],
+     [ 0.00011127085,  -0.000096261386,  0.000110602057],
+     [-0.00011127085,  -0.000096261386,  0.000110602057],
+     [-0.           ,   0.            , -0.00139615575 ],
+     [-0.           ,   0.            , -0.000684195246],
+     [ 0.           ,   0.            ,  0.001393980177],
+     [ 0.           ,   0.            ,  0.000053294161]])
+_tot_uncp_grad = np.array(
+    [[-0.            ,  0.004688102439,  0.000019589414],
+     [ 0.            , -0.004688102439,  0.000019589414],
+     [-0.007232900028,  0.004303778033,  0.000005580357],
+     [ 0.007232900028,  0.004303778033,  0.000005580357],
+     [ 0.007232900028, -0.004303778033,  0.000005580357],
+     [-0.007232900028, -0.004303778033,  0.000005580357],
+     [-0.            ,  0.            , -0.035419642667],
+     [-0.            ,  0.            ,  0.03585801241 ],
+     [ 0.            ,  0.            ,  0.008543047852],
+     [ 0.            ,  0.            , -0.009042917851]])
+_ie_uncp_grad = np.array(
+    [[-0.           ,   0.001530144706, -0.000142748248],
+     [ 0.           ,  -0.001530144706, -0.000142748248],
+     [-0.00013786911,   0.000066897048,  0.000086749188],
+     [ 0.00013786911,   0.000066897048,  0.000086749188],
+     [ 0.00013786911,  -0.000066897048,  0.000086749188],
+     [-0.00013786911,  -0.000066897048,  0.000086749188],
+     [-0.           ,   0.            , -0.001260250416],
+     [-0.           ,  -0.            , -0.000373312041],
+     [ 0.           ,   0.            ,  0.00152714311 ],
+     [ 0.           ,   0.            ,  0.000044919089]])
+
+
+_SEC_A = chr(0xA7) + "A"
+
+
+def _normalize_nbody_text(s: str) -> str:
+    """Normalize section symbol encoding on Windows to handle mojibake patterns."""
+    return (
+        s.replace("\ufffdA", "§A")   # '�A' -> '§A' (replacement char mojibake)
+         .replace("Â§", "§")         # Windows cp1252 double-encoding
+         .replace("\xa7", "§")       # Direct byte representation
+    )
+
+
+_stdouts = {
+    "cp_T": rf"""
+\s*   ==> N-Body: Counterpoise Corrected \(CP\) energies <==
+\s*     MC n-Body\s+Total Energy            Interaction Energy                          N-body Contribution to Interaction Energy
+\s*                   \[Eh\]                    \[Eh\]                  \[kcal/mol\]            \[Eh\]                  \[kcal/mol\]
+\s*           {_SEC_A}\s+1     -155.405884\d\d\d\d\d\d        0.000000000000        0.000000000000        0.000000000000        0.000000000000
+\s*  FULL/RTN {_SEC_A}\s+2     -155.407610\d\d\d\d\d\d       -0.001726\d\d\d\d\d\d       -1.0831\d\d\d\d\d\d\d\d       -0.001726\d\d\d\d\d\d       -1.0831\d\d\d\d\d\d\d\d
+\s*
+\s*MC Legend: {_SEC_A}: "\(auto\)"
+\s*
+""",
+    "cp_F": rf"""
+\s*   ==> N-Body: Counterpoise Corrected \(CP\) energies <==
+\s*     MC n-Body\s+Total Energy            Interaction Energy                          N-body Contribution to Interaction Energy
+\s*                   \[Eh\]                    \[Eh\]                  \[kcal/mol\]            \[Eh\]                  \[kcal/mol\]
+\s*           {_SEC_A}\s+1        N/A                   0.000000000000        0.000000000000        0.000000000000        0.000000000000
+\s*  FULL/RTN {_SEC_A}\s+2        N/A                  -0.001726\d\d\d\d\d\d       -1.0831\d\d\d\d\d\d\d\d       -0.001726\d\d\d\d\d\d       -1.0831\d\d\d\d\d\d\d\d
+\s*
+\s*MC Legend: {_SEC_A}: "\(auto\)"
+\s*
+""",
+    "uncp": rf"""
+\s*   ==> N-Body: Non-Counterpoise Corrected \(NoCP\) energies <==
+\s*     MC n-Body\s+Total Energy            Interaction Energy                          N-body Contribution to Interaction Energy
+\s*                   \[Eh\]                    \[Eh\]                  \[kcal/mol\]            \[Eh\]                  \[kcal/mol\]
+\s*           {_SEC_A}\s+1     -155.405884\d\d\d\d\d\d        0.000000000000        0.000000000000        0.000000000000        0.000000000000
+\s*  FULL/RTN {_SEC_A}\s+2     -155.408871\d\d\d\d\d\d       -0.002987\d\d\d\d\d\d       -1.8746\d\d\d\d\d\d\d\d       -0.002987\d\d\d\d\d\d       -1.8746\d\d\d\d\d\d\d\d
+\s*
+\s*MC Legend: {_SEC_A}: "\(auto\)"
+\s*
+""",
+}
+_stdouts["cpuncp"] = _stdouts["cp_T"] + _stdouts["uncp"]
+_stdouts["uncpcp"] = _stdouts["uncp"] + _stdouts["cp_T"]
+
+
+@pytest.mark.parametrize("driver,bsse_type,return_total_data,nbody_number,return_result,stdoutkey", [
+    ("energy",   ["cp"],         True , 5, _tot_cp_ene,   "cp_T"),     # return CP tot         5
+    ("energy",   ["cp"],         False, 3, _ie_cp_ene,    "cp_F"),     # return CP IE          3
+    ("energy",   ["cp"],         None , 3, _ie_cp_ene,    "cp_F"),     # return CP IE          3
+    ("energy",   ["nocp"],       True , 3, _tot_uncp_ene, "uncp"),     # return tot            3
+    ("energy",   ["nocp"],       False, 3, _ie_uncp_ene,  "uncp"),     # return IE             3
+    ("energy",   ["nocp"],       None , 3, _ie_uncp_ene,  "uncp"),     # return IE             3
+    ("energy",   ["cp", "nocp"], True , 5, _tot_cp_ene,   "cpuncp"),   # return CP tot         5
+    ("energy",   ["cp", "nocp"], False, 5, _ie_cp_ene,    "cpuncp"),   # return CP IE          5
+    ("energy",   ["cp", "nocp"], None , 5, _ie_cp_ene,    "cpuncp"),   # return CP IE          5
+    ("energy",   ["nocp", "cp"], True , 5, _tot_uncp_ene, "uncpcp"),   # return tot            5
+    ("energy",   ["nocp", "cp"], False, 5, _ie_uncp_ene,  "uncpcp"),   # return IE             5
+    ("energy",   ["nocp", "cp"], None , 5, _ie_uncp_ene,  "uncpcp"),   # return IE             5
+    ("energy",   ["ssfc"],       None , 3, _ie_cp_ene,    "cp_F"),     # return CP IE          3
+    ("gradient", ["cp"],         True , 5, _tot_cp_grad,   "cp_T"),    # return CP tot G       5
+    ("gradient", ["cp"],         False, 3, _ie_cp_grad,    "cp_F"),    # return CP IE G        3
+    ("gradient", ["cp"],         None , 5, _tot_cp_grad,   "cp_T"),    # return CP tot G       5
+    ("gradient", ["nocp"],       True , 3, _tot_uncp_grad, "uncp"),    # return tot G          3
+    ("gradient", ["nocp"],       False, 3, _ie_uncp_grad,  "uncp"),    # return IE G           3
+    ("gradient", ["nocp"],       None , 3, _tot_uncp_grad, "uncp"),    # return tot G          3
+    ("gradient", ["cp", "nocp"], True , 5, _tot_cp_grad,   "cpuncp"),  # return CP tot G       5
+    ("gradient", ["cp", "nocp"], False, 5, _ie_cp_grad,    "cpuncp"),  # return CP IE G        5
+    ("gradient", ["cp", "nocp"], None , 5, _tot_cp_grad,   "cpuncp"),  # return CP tot G       5
+    ("gradient", ["nocp", "cp"], True , 5, _tot_uncp_grad, "uncpcp"),  # return tot G          5
+    ("gradient", ["nocp", "cp"], False, 5, _ie_uncp_grad,  "uncpcp"),  # return IE G           5
+    ("gradient", ["nocp", "cp"], None , 5, _tot_uncp_grad, "uncpcp"),  # return tot G          5
+    ("gradient", ["nocp", "ssfc"], None , 5, _tot_uncp_grad, "uncpcp"),  # return tot G          5
+])
+@uusing("qcmanybody")
+def test_nbody_number(driver, bsse_type, return_total_data, nbody_number, return_result, stdoutkey):
+
+    eneyne = psi4.geometry("""
+C   0.000000  -0.667578  -2.124659
+C   0.000000   0.667578  -2.124659
+H   0.923621  -1.232253  -2.126185
+H  -0.923621  -1.232253  -2.126185
+H  -0.923621   1.232253  -2.126185
+H   0.923621   1.232253  -2.126185
+--
+C   0.000000   0.000000   2.900503
+C   0.000000   0.000000   1.693240
+H   0.000000   0.000000   0.627352
+H   0.000000   0.000000   3.963929
+""")
+
+    # nbody_number arbitrarily chosen to split among QCSchema v1/v2
+    if nbody_number == 3:
+      schver = 1
+      atin = {
+        "driver": driver,
+        "model": {
+            "method": "mp2",
+            "basis": "cc-pvdz",
+        },
+        "molecule": eneyne.to_schema(dtype=2),
+        "keywords": {
+            "function_kwargs": {
+                "bsse_type": bsse_type,
+                "return_total_data": return_total_data,
+            },
+        },
+      }
+    else:
+      schver = 2
+      atin = {
+       "molecule": eneyne.to_schema(dtype=3),
+       "specification": {
+        "driver": driver,
+        "model": {
+            "method": "mp2",
+            "basis": "cc-pvdz",
+        },
+        "keywords": {
+            "function_kwargs": {
+                "bsse_type": bsse_type,
+                "return_total_data": return_total_data,
+            },
+        },
+       },
+      }
+
+    if _ispy314 and schver == 1:
+        pytest.skip(reason="Py314+QCSk1")
+
+    if psi4.core.get_option("scf", "orbital_optimizer_package") != "INTERNAL":  # KP-MATCH
+        if schver == 1:
+            atin["keywords"].update({"d_convergence": 5e-10})
+        elif schver == 2:
+            atin["specification"]["keywords"].update({"d_convergence": 5e-10})
+
+    ret = psi4.schema_wrapper.run_qcschema(atin)
+
+    assert ret.success, pprint.pprint(ret.dict(), width=200)
+    assert ret.schema_version == schver
+    assert ret.schema_name == _sch_name[schver]
+
+    assert compare_values(return_result, ret.return_result, atol=1.e-6, label="manybody")
+    assert compare(nbody_number, ret.extras["qcvars"]["NBODY NUMBER"], label="nbody number")
+    assert re.search(_stdouts[stdoutkey], _normalize_nbody_text(ret.stdout), re.MULTILINE), f"N-Body pattern not found: {_stdouts[stdoutkey]}"

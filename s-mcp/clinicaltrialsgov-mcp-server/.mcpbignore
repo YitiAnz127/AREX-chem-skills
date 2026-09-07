@@ -1,0 +1,11 @@
+.env*
+.mcpregistry_*
+/.claude/
+/.agents/
+/skills/
+Dockerfile
+bun.lock
+bunfig.toml
+biome.json
+tsconfig*.json
+vitest.config.ts

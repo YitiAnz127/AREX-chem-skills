@@ -1,0 +1,24 @@
+# Default GAFF2 configuration for the 42-38 FEP example
+
+fundamental:
+  ref: "42"
+  mut: "38"
+  rec: receptor.pdb
+
+model:
+  distance: 8
+  temperature: 302.15
+  concentration: 0.05
+  disoff: 1
+
+simulation:
+  numofsteps: 500000
+  repeats: 4
+
+forcefield:
+  # Ligand force field type; use with an AMBER protein force field.
+  type: gaff2
+  params: {}  # GAFF2 assigns AM1-BCC charges by default.
+
+other:
+  verbose: true
